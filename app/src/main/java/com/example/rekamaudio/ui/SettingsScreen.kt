@@ -36,6 +36,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
+import com.example.rekamaudio.BuildConfig
 import com.example.rekamaudio.R
 import com.example.rekamaudio.data.model.AudioQuality
 import com.example.rekamaudio.data.model.Mp3Bitrate
@@ -126,6 +127,19 @@ fun SettingsScreen(
                     onCheckedChange = { viewModel.setStreamingEnabled(it) }
                 )
             }
+
+            Text(
+                text = stringResource(R.string.about_category),
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.padding(start = 16.dp, top = 24.dp, bottom = 8.dp)
+            )
+
+            SettingsItem(
+                title = stringResource(R.string.app_version),
+                subtitle = "${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})",
+                onClick = {}
+            )
         }
     }
 }

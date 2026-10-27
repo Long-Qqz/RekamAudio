@@ -14,8 +14,8 @@ android {
         applicationId = "com.example.rekamaudio"
         minSdk = 29
         targetSdk = 35
-        versionCode = 7
-        versionName = "1.3.2"
+        versionCode = 8
+        versionName = "1.3.3"
 
         ndk {
             abiFilters += listOf("arm64-v8a")
@@ -65,6 +65,9 @@ android {
     }
     buildFeatures {
         compose = true
+        // Exposes VERSION_NAME so the settings screen can show which build is
+        // installed — build numbers are otherwise impossible to tell apart.
+        buildConfig = true
     }
 }
 

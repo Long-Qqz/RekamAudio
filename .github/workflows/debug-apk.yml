@@ -25,6 +25,14 @@ jobs:
           chmod +x gradlew
           ./gradlew app:assembleDebug
 
+      - name: Read app version
+        id: appversion
+        run: |
+          VERSION=$(grep -m1 'versionName' app/build.gradle.kts | sed 's/.*"\(.*\)".*/\1/')
+          CODE=$(grep -m1 'versionCode' app/build.gradle.kts | sed 's/[^0-9]//g')
+          echo "name=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+
       - name: Rename APK
         run: cp app/build/outputs/apk/debug/app-debug.apk RekamAudio.apk
 
@@ -41,7 +49,7 @@ jobs:
           tag_name: apk
           name: Rekam Audio
           body: |
-            Rekam Audio APK (v1.3.2, arm64)
+            Rekam Audio APK (v${{ steps.appversion.outputs.name }}, build ${{ steps.appversion.outputs.code }}, arm64)
 
             ## ✨ Features / 功能
 
@@ -49,12 +57,19 @@ jobs:
             - WAV / M4A / MP3 recording formats · WAV（无损）/ M4A / MP3 三种录音格式
             - Configurable MP3 bitrate (128 / 192 / 320 kbps) · MP3 码率三档可选（128 / 192 / 320 kbps）
             - Streaming MP3 encoding (real-time, no post-recording wait) · 实时流式 MP3 编码（边录边编码，停止即出文件）
-            - Live MP3 transcoding progress (overlay ring + notification) · MP3 转码实时进度（悬浮按钮进度环 + 通知栏百分比）
+            - Determinate encoding progress bar with percentage · 编码进度条（圆环 + 百分比）
             - WAV fallback when MP3 encoding fails · 转码失败时自动降级保存 WAV，录音绝不丢失
             - Playback seek bar · 播放进度条，可拖动跳转任意位置
             - Draggable floating record button · 悬浮录音按钮，按住拖动即可改变位置
             - File size shown in recording list · 录音列表显示文件大小与日期
+            - App version shown in Settings · 设置页显示应用版本号
             - Fixed signing key · 固定签名密钥，新版可直接覆盖安装升级
+
+            ## 🐞 Fixes / 修复
+
+            - Intermittent silent recordings · 修复偶发录不上声音（唤醒锁 + 投影复用 + 读错误检测）
+            - Stop could hang while encoding · 修复点击停止后编码卡死
+            - Long recordings losing audio · 修复长录音丢失音频
 
             ## 📥 Install / 安装
 
