@@ -44,6 +44,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import javax.inject.Inject
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -656,7 +657,7 @@ class AudioCaptureService : Service() {
                             "encoding ${pcmFile.length()} bytes of PCM backup"
                     )
                     withMainThread { overlayManager.showEncoding() }
-                    encodeMp3Async(pcmFile, timestamp, bitrate)
+                    encodeMp3Async(pcmFile, timestamp, bitrate, "${timestamp}_fb")
                 } else {
                     Log.e("AudioCaptureService", "Streaming MP3 captured 0 bytes")
                     pcmFile.delete()
@@ -687,7 +688,7 @@ class AudioCaptureService : Service() {
             val command = "-y -f s16le -ar $SAMPLE_RATE -ac $CHANNEL_COUNT " +
                 "-i ${fifoFile.absolutePath} -codec:a libmp3lame -b:a ${bitrate.bitsPerSecond} ${mp3File.absolutePath}"
 
-            FFmpegKit.executeAsync(
+            val streamSession = FFmpegKit.executeAsync(
                 command,
                 { session ->
                     val ok = ReturnCode.isSuccess(session.returnCode)
@@ -699,12 +700,24 @@ class AudioCaptureService : Service() {
                         )
                     }
                     encodeDone.countDown()
-                    // Fast path: the user already pressed stop, so finish the
-                    // hand-off right here rather than making them wait.
+                    // Only finish from here once the capture side has stopped;
+                    // finalising mid-recording would touch the PCM file the
+                    // capture loop is still writing to.
                     if (captureFinished.get()) finalizeStream(ok)
                 },
                 { /* logs ignored */ },
-                null
+                { statistics ->
+                    // Live progress while the session flushes, so the overlay
+                    // can show a determinate bar instead of a spinner.
+                    val durationMs = state.capturedBytes.get() * 1000L /
+                        (SAMPLE_RATE.toLong() * CHANNEL_COUNT * 2L)
+                    if (durationMs > 0L) {
+                        val progress = (statistics.time / durationMs.toDouble())
+                            .coerceIn(0.0, 1.0)
+                            .toFloat()
+                        withMainThread { overlayManager.updateEncodingProgress(progress) }
+                    }
+                }
             )
 
             // O_RDWR never blocks on a FIFO. Opening O_WRONLY without a reader
@@ -748,6 +761,7 @@ class AudioCaptureService : Service() {
 
                 // Disk copy first: it must survive whatever the pipe does.
                 pcmSink.write(buffer, 0, readResult)
+                state.capturedBytes.addAndGet(readResult.toLong())
 
                 if (!state.stalled.get()) {
                     val copy = buffer.copyOf(readResult)
@@ -780,29 +794,27 @@ class AudioCaptureService : Service() {
             runCatching { fifoOut?.close() }
             fifoOut = null
 
-            // The audio was encoded while recording, so there is nothing left to
-            // wait for: show the finishing ring and let ffmpeg's callback save
-            // the file. Pressing stop now returns almost immediately.
+            // Show the finishing progress bar and hand off to ffmpeg.
             withMainThread { overlayManager.showEncoding() }
             captureFinished.set(true)
-            if (encodeDone.count == 0L) {
-                finalizeStream(state.encodeSucceeded.get())
-            }
 
-            // Safety net: a wedged ffmpeg must never leave the ring spinning.
-            Thread {
-                try {
-                    if (!encodeDone.await(FINALIZE_WATCHDOG_SECONDS, TimeUnit.SECONDS)) {
-                        Log.e("AudioCaptureService", "ffmpeg never finished the streaming encode")
-                        finalizeStream(false)
-                    }
-                } catch (e: InterruptedException) {
-                    // Nothing to recover from; the recording is already safe.
-                }
-            }.apply {
-                isDaemon = true
-                name = "rekam-stream-watchdog"
-                start()
+            // Bounded grace period. A healthy pipe delivers EOF right away and
+            // this returns in a few hundred milliseconds. If the pipe never got
+            // its EOF (writer stuck in a blocking write) the session would hang
+            // forever, so we cancel it and encode the complete PCM backup
+            // instead — the recording is never lost and the ring never spins.
+            val streamFinished = runCatching {
+                encodeDone.await(STREAM_FINISH_GRACE_SECONDS, TimeUnit.SECONDS)
+            }.getOrDefault(false)
+
+            if (streamFinished) {
+                // No-op when the completion callback already finalised.
+                finalizeStream(state.encodeSucceeded.get())
+            } else {
+                Log.w("AudioCaptureService", "Streaming encode did not finish in time, cancelling it")
+                runCatching { FFmpegKit.cancel(streamSession.sessionId) }
+                state.stalled.set(true)
+                finalizeStream(false)
             }
         } catch (t: Throwable) {
             Log.e("AudioCaptureService", "Error in streaming MP3 recording", t)
@@ -824,10 +836,20 @@ class AudioCaptureService : Service() {
         val stalled = java.util.concurrent.atomic.AtomicBoolean(false)
         val encodeSucceeded = java.util.concurrent.atomic.AtomicBoolean(false)
         val feedClosed = java.util.concurrent.atomic.AtomicBoolean(false)
+        val capturedBytes = java.util.concurrent.atomic.AtomicLong(0L)
     }
 
-    private fun encodeMp3Async(pcmFile: File, timestamp: String, bitrate: Mp3Bitrate) {
-        val mp3File = File(cacheDir, "rekam_tmp_$timestamp.mp3")
+    /**
+     * [outputTag] keeps the temporary MP3 path distinct from the streaming
+     * session's output so a fallback re-encode can never race with it.
+     */
+    private fun encodeMp3Async(
+        pcmFile: File,
+        timestamp: String,
+        bitrate: Mp3Bitrate,
+        outputTag: String = timestamp
+    ) {
+        val mp3File = File(cacheDir, "rekam_tmp_$outputTag.mp3")
         val totalDurationMs = pcmFile.length() * 1000L / (SAMPLE_RATE * CHANNEL_COUNT * 2L)
 
         try {
@@ -1172,19 +1194,21 @@ class AudioCaptureService : Service() {
         recordingJob = null
         job?.cancel()
 
-        releaseWakeLock()
-
-        try {
-            audioRecord?.stop()
-        } catch (e: Exception) {
-             Log.e("AudioCaptureService", "Error stopping audioRecord", e)
-        }
-        try {
-            audioRecord?.release()
-        } catch (e: Exception) {
-             Log.e("AudioCaptureService", "Error releasing audioRecord", e)
-        }
+        // The capture loop notices isRecording == false immediately, but it may
+        // still be inside a blocking AudioRecord.read(). Tearing the device down
+        // underneath that call is undefined behaviour, so the release is deferred
+        // until the loop has left it.
+        val record = audioRecord
         audioRecord = null
+        CoroutineScope(Dispatchers.IO).launch {
+            runCatching { withTimeoutOrNull(AUDIO_RELEASE_TIMEOUT_MS) { job?.join() } }
+            runCatching { record?.stop() }
+                .onFailure { Log.e("AudioCaptureService", "Error stopping audioRecord", it) }
+            runCatching { record?.release() }
+                .onFailure { Log.e("AudioCaptureService", "Error releasing audioRecord", it) }
+        }
+
+        releaseWakeLock()
 
         // A MediaProjection consent token is single-use. In overlay mode the
         // projection must stay alive so the next recording can reuse it —
@@ -1249,8 +1273,11 @@ class AudioCaptureService : Service() {
         private const val FIFO_JOIN_TIMEOUT_MS = 1000L
         private const val FIFO_DRAIN_TIMEOUT_MS = 1500L
 
-        /** Last-resort guard so ffmpeg can never leave the encoding ring stuck. */
-        private const val FINALIZE_WATCHDOG_SECONDS = 120L
+        /** How long the stop path waits for ffmpeg before cancelling it outright. */
+        private const val STREAM_FINISH_GRACE_SECONDS = 6L
+
+        /** Upper bound on waiting for the capture loop before releasing the device. */
+        private const val AUDIO_RELEASE_TIMEOUT_MS = 1500L
         const val ACTION_START = "START"
         const val ACTION_STOP = "STOP"
         const val ACTION_SHOW_OVERLAY = "SHOW_OVERLAY"

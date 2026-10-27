@@ -8,8 +8,9 @@ import android.os.Bundle
 import android.util.DisplayMetrics
 import android.view.Gravity
 import android.view.WindowManager
+import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
-import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.LinearOutSlowInEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloat
@@ -34,10 +35,10 @@ import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -313,36 +314,27 @@ private fun OverlayContent(
             .size(BUTTON_SIZE)
 
         if (buttonState == OverlayButtonState.ENCODING) {
-            // Encoding in progress: determinate ring (post-recording) or spinning (streaming)
-            val isIndeterminate = encodeProgress <= 0f
-            val sweepAngle by if (isIndeterminate) {
-                val infiniteTransition = rememberInfiniteTransition(label = "encodingSpin")
-                infiniteTransition.animateFloat(
-                    initialValue = 0f,
-                    targetValue = 360f,
-                    animationSpec = infiniteRepeatable(
-                        animation = tween(1500, easing = LinearEasing),
-                        repeatMode = RepeatMode.Restart
-                    ),
-                    label = "spinAngle"
+            // Determinate ring: the user must always see how far along the
+            // encoding is. A spinner gives no signal at all about whether the
+            // work is moving, which is exactly what made a slow flush look
+            // like a freeze.
+            val realProgress = encodeProgress.coerceIn(0f, 1f)
+            // Creep keeps the arc alive when ffmpeg reports nothing yet; it
+            // stops at 90% so it never claims completion prematurely.
+            val creep = remember { Animatable(0f) }
+            LaunchedEffect(Unit) {
+                creep.animateTo(
+                    targetValue = 0.9f,
+                    animationSpec = tween(12000, easing = LinearOutSlowInEasing)
                 )
-            } else {
-                remember { derivedStateOf { 360f * encodeProgress } }
             }
-            val startAngle by if (isIndeterminate) {
-                val infiniteTransition = rememberInfiniteTransition(label = "encodingSpin2")
-                infiniteTransition.animateFloat(
-                    initialValue = 0f,
-                    targetValue = 360f,
-                    animationSpec = infiniteRepeatable(
-                        animation = tween(1500, easing = LinearEasing),
-                        repeatMode = RepeatMode.Restart
-                    ),
-                    label = "spinStart"
-                )
-            } else {
-                remember { mutableFloatStateOf(-90f) }
-            }
+            val shownProgress = maxOf(realProgress, creep.value).coerceIn(0f, 1f)
+            val sweepAngle by animateFloatAsState(
+                targetValue = 360f * shownProgress,
+                animationSpec = tween(250),
+                label = "encodingSweep"
+            )
+            val percent = (shownProgress * 100).toInt().coerceIn(0, 100)
 
             Surface(
                 onClick = onStopClick,
@@ -358,11 +350,11 @@ private fun OverlayContent(
                     contentAlignment = Alignment.Center
                 ) {
                     val ringColor = MaterialTheme.colorScheme.onSecondaryContainer
-                    Canvas(modifier = Modifier.size(30.dp)) {
+                    Canvas(modifier = Modifier.size(44.dp)) {
                         val stroke = 4.dp.toPx()
                         val inset = stroke / 2
                         val arcSize = Size(size.width - stroke, size.height - stroke)
-                        // Background ring
+                        // Background track
                         drawArc(
                             color = ringColor.copy(alpha = 0.15f),
                             startAngle = 0f,
@@ -372,17 +364,22 @@ private fun OverlayContent(
                             size = arcSize,
                             style = Stroke(width = stroke)
                         )
-                        // Foreground arc
+                        // Completed portion
                         drawArc(
                             color = ringColor,
-                            startAngle = startAngle,
-                            sweepAngle = if (isIndeterminate) 90f else sweepAngle,
+                            startAngle = -90f,
+                            sweepAngle = sweepAngle,
                             useCenter = false,
                             topLeft = Offset(inset, inset),
                             size = arcSize,
                             style = Stroke(width = stroke, cap = StrokeCap.Round)
                         )
                     }
+                    Text(
+                        text = "$percent%",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer
+                    )
                 }
             }
         } else {
