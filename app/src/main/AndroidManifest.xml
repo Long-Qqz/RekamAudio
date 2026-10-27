@@ -15,6 +15,10 @@
     <!-- Notification permission (Android 13+) -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- Keeps the CPU awake during long recordings so audio is not dropped
+         once the screen turns off -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
     <application
         android:name=".RekamAudioApp"
         android:allowBackup="true"

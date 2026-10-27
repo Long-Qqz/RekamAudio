@@ -22,9 +22,14 @@ import android.os.Build
 import android.system.ErrnoException
 import android.os.IBinder
 import android.os.ParcelFileDescriptor
+import android.os.PowerManager
 import android.os.SystemClock
 import android.provider.MediaStore
+import android.system.OsConstants
 import android.util.Log
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.arthenica.ffmpegkit.FFmpegKit
@@ -65,7 +70,7 @@ class AudioCaptureService : Service() {
     private var mediaCodec: MediaCodec? = null
     private var mediaMuxer: MediaMuxer? = null
     private var recordingJob: Job? = null
-    private var isRecording = false
+    @Volatile private var isRecording = false
     private var currentFileUri: Uri? = null
     private var audioQuality: AudioQuality = AudioQuality.MEDIUM_QUALITY_M4A
 
@@ -74,6 +79,23 @@ class AudioCaptureService : Service() {
     private var savedResultData: Intent? = null
     private var isOverlayMode = false
     private var lastProgressNotifyMs: Long = 0L
+
+    // Long recordings must not let the CPU doze off: without a wake lock the
+    // recording thread stops being scheduled when the screen turns off and the
+    // AudioRecord buffer silently overflows, leaving an empty file behind.
+    private var wakeLock: PowerManager.WakeLock? = null
+
+    // Guards against a "stop" arriving while startRecording() is still inside
+    // its setup window: a stale setup must never resurrect a cancelled session.
+    @Volatile private var sessionGeneration = 0
+
+    // Consecutive AudioRecord.read() failures. A dead projection or a lost audio
+    // source makes read() return a negative error code forever; without this the
+    // capture loop would spin silently and produce an empty recording.
+    private var consecutiveReadErrors = 0
+    private var captureFailureNotified = false
+
+    @Volatile private var totalBytesCaptured = 0L
 
     override fun onCreate() {
         super.onCreate()
@@ -98,7 +120,10 @@ class AudioCaptureService : Service() {
                 if (resultCode != 0 && resultData != null) {
                     savedResultCode = resultCode
                     savedResultData = resultData
-                    
+                    // A freshly granted consent token supersedes any cached
+                    // projection; keeping the old one would capture silence.
+                    if (!isRecording) stopProjection()
+
                     startForegroundServiceNotification()
                     startRecording(resultCode, resultData)
                     overlayManager.updateState(true) // Update overlay if active
@@ -124,6 +149,9 @@ class AudioCaptureService : Service() {
                 if (resultCode != 0 && resultData != null) {
                     savedResultCode = resultCode
                     savedResultData = resultData
+                    // A freshly granted consent token supersedes any cached
+                    // projection; keeping the old one would capture silence.
+                    if (!isRecording) stopProjection()
                 }
                 
                 val qualityName = intent.getStringExtra(EXTRA_AUDIO_QUALITY)
@@ -182,13 +210,35 @@ class AudioCaptureService : Service() {
             return
         }
 
-        mediaProjection = mediaProjectionManager?.getMediaProjection(resultCode, resultData)
-        mediaProjection?.registerCallback(object : MediaProjection.Callback() {
-            override fun onStop() {
-                stopRecording()
-                overlayManager.updateState(false)
-            }
-        }, null)
+        // A MediaProjection consent token is single-use: once stop() is called
+        // the same Intent can never be redeemed again. Reusing the live
+        // projection across overlay sessions is what makes repeat recordings
+        // work at all. Only fall back to redeeming the token on the first run.
+        val projection = mediaProjection ?: runCatching {
+            mediaProjectionManager?.getMediaProjection(resultCode, resultData)
+        }.onFailure {
+            Log.e("AudioCaptureService", "getMediaProjection failed", it)
+        }.getOrNull()
+
+        if (projection == null) {
+            reportCaptureFailure(getString(R.string.capture_failed_title), "MediaProjection unavailable")
+            return
+        }
+        if (mediaProjection == null) {
+            mediaProjection = projection
+            projection.registerCallback(object : MediaProjection.Callback() {
+                override fun onStop() {
+                    Log.w("AudioCaptureService", "MediaProjection stopped by the system")
+                    stopRecording()
+                    // The projection object is dead. Drop it, otherwise the next
+                    // recording reuses it and silently captures nothing.
+                    stopProjection()
+                    withMainThread { overlayManager.updateState(false) }
+                }
+            }, null)
+        }
+
+        val generation = ++sessionGeneration
 
         // Launch into background to allow delay and offload setup
         CoroutineScope(Dispatchers.IO).launch {
@@ -197,7 +247,14 @@ class AudioCaptureService : Service() {
                 // before asking for AudioPlaybackCapture. This prevents the "silent audio" race condition.
                 kotlinx.coroutines.delay(500)
 
-                val config = AudioPlaybackCaptureConfiguration.Builder(mediaProjection!!)
+                // The user may have pressed stop while we were waiting; bail out
+                // instead of resurrecting a recording they already cancelled.
+                if (generation != sessionGeneration) {
+                    Log.d("AudioCaptureService", "Recording setup cancelled before it started")
+                    return@launch
+                }
+
+                val config = AudioPlaybackCaptureConfiguration.Builder(projection)
                     .addMatchingUsage(AudioAttributes.USAGE_GAME)
                     .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
                     .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
@@ -213,15 +270,13 @@ class AudioCaptureService : Service() {
 
                 if (ContextCompat.checkSelfPermission(this@AudioCaptureService, android.Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
                     Log.e("AudioCaptureService", "Recording permission not granted")
+                    reportCaptureFailure(getString(R.string.capture_failed_title), "RECORD_AUDIO permission not granted")
                     stopRecording() // This is running on IO thread
-                    withContext(Dispatchers.Main) {
-                        overlayManager.updateState(false)
-                    }
                     if (!isOverlayMode) stopSelf()
                     return@launch
                 }
 
-                audioRecord = AudioRecord.Builder()
+                val record = AudioRecord.Builder()
                     .setAudioPlaybackCaptureConfig(config)
                     .setAudioFormat(
                         AudioFormat.Builder()
@@ -233,25 +288,40 @@ class AudioCaptureService : Service() {
                     .setBufferSizeInBytes(bufferSize)
                     .build()
 
-                if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
+                if (record.state != AudioRecord.STATE_INITIALIZED) {
                     Log.e("AudioCaptureService", "AudioRecord failed to initialize")
+                    record.release()
+                    reportCaptureFailure(getString(R.string.capture_failed_title), "AudioRecord not initialized")
                     stopRecording()
-                    withContext(Dispatchers.Main) {
-                        overlayManager.updateState(false)
-                    }
                     if (!isOverlayMode) stopSelf()
                     return@launch
                 }
 
-                audioRecord?.startRecording()
+                audioRecord = record
+
+                record.startRecording()
+                if (record.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                    Log.e("AudioCaptureService", "AudioRecord did not enter RECORDING state")
+                    reportCaptureFailure(getString(R.string.capture_failed_title), "AudioRecord not recording")
+                    stopRecording()
+                    if (!isOverlayMode) stopSelf()
+                    return@launch
+                }
+
+                // Reset per-session counters before the capture loops start.
+                consecutiveReadErrors = 0
+                captureFailureNotified = false
+                totalBytesCaptured = 0L
+
                 isRecording = true
+                acquireWakeLock()
                 getSharedPreferences(PREFS_NAME, android.content.Context.MODE_PRIVATE)
                     .edit()
                     .putBoolean(KEY_IS_RECORDING, true)
                     .apply()
 
                 Log.d("AudioCaptureService", "AudioRecord started successfully")
-                
+
                 withContext(Dispatchers.Main) {
                     overlayManager.updateState(true)
                 }
@@ -274,10 +344,8 @@ class AudioCaptureService : Service() {
                 }
             } catch (e: Exception) {
                 Log.e("AudioCaptureService", "Error starting recording", e)
+                reportCaptureFailure(getString(R.string.capture_failed_title), e.javaClass.simpleName + ": " + e.message)
                 stopRecording()
-                withContext(Dispatchers.Main) {
-                    overlayManager.updateState(false)
-                }
                 if (!isOverlayMode) stopSelf()
             }
         }
@@ -288,7 +356,10 @@ class AudioCaptureService : Service() {
         currentFileUri = uri
         
         var pfd: ParcelFileDescriptor? = null
-        
+        // Declared outside the try so the finally block can tell the user when
+        // nothing at all was captured.
+        var totalBytesRead = 0L
+
         try {
              pfd = contentResolver.openFileDescriptor(uri, "w")
              val fd = pfd?.fileDescriptor ?: return
@@ -312,13 +383,16 @@ class AudioCaptureService : Service() {
             var isMuxerStarted = false
             
             val inputBuffer = ByteArray(bufferSize)
-            var totalBytesRead = 0L
             var lastLogTime = 0L
 
             while (isRecording) {
                 // Read PCM data
-                val readResult = audioRecord?.read(inputBuffer, 0, bufferSize) ?: 0
-                
+                val readResult = readAudioChunk(inputBuffer, bufferSize, "m4a")
+                if (readResult < 0 && isCaptureBroken()) {
+                    Log.e("AudioCaptureService", "Aborting M4A capture: AudioRecord unrecoverable")
+                    break
+                }
+
                 if (readResult > 0) {
                     // Diagnostic Logging (every 2 seconds)
                     val currentTime = System.currentTimeMillis()
@@ -395,10 +469,13 @@ class AudioCaptureService : Service() {
                 mediaMuxer?.stop()
                 mediaMuxer?.release()
                 pfd?.close()
-                if (isRecording) { // If stopped properly, otherwise maybe error
-                    finalizeMediaStoreEntry(uri)
-                } else {
-                     finalizeMediaStoreEntry(uri)
+                finalizeMediaStoreEntry(uri)
+                if (totalBytesRead == 0L) {
+                    Log.e("AudioCaptureService", "M4A recording captured 0 bytes")
+                    reportCaptureFailure(
+                        getString(R.string.capture_failed_title),
+                        getString(R.string.capture_failed_text)
+                    )
                 }
             } catch (e: Exception) {
                 Log.e("AudioCaptureService", "Error releasing resources", e)
@@ -415,7 +492,10 @@ class AudioCaptureService : Service() {
         
         var pfd: ParcelFileDescriptor? = null
         var outputStream: FileOutputStream? = null
-        
+        // Declared outside the try so the finally block can report a session
+        // that captured nothing at all.
+        var totalBytesRead = 0L
+
         try {
             pfd = contentResolver.openFileDescriptor(uri, "w")
             val fd = pfd?.fileDescriptor ?: return
@@ -427,10 +507,13 @@ class AudioCaptureService : Service() {
             outputStream.write(header)
 
             val buffer = ByteArray(bufferSize)
-            var totalBytesRead = 0L
             
             while (isRecording) {
-                val readResult = audioRecord?.read(buffer, 0, bufferSize) ?: 0
+                val readResult = readAudioChunk(buffer, bufferSize, "wav")
+                if (readResult < 0 && isCaptureBroken()) {
+                    Log.e("AudioCaptureService", "Aborting WAV capture: AudioRecord unrecoverable")
+                    break
+                }
                 if (readResult > 0) {
                     outputStream.write(buffer, 0, readResult)
                     totalBytesRead += readResult.toLong()
@@ -448,6 +531,13 @@ class AudioCaptureService : Service() {
                 outputStream?.close()
                 pfd?.close()
                 finalizeMediaStoreEntry(uri)
+                if (totalBytesRead == 0L) {
+                    Log.e("AudioCaptureService", "WAV recording captured 0 bytes")
+                    reportCaptureFailure(
+                        getString(R.string.capture_failed_title),
+                        getString(R.string.capture_failed_text)
+                    )
+                }
             } catch (e: Exception) {
                 Log.e("AudioCaptureService", "Error closing resources", e)
             }
@@ -463,25 +553,45 @@ class AudioCaptureService : Service() {
     private fun recordMp3Audio(bufferSize: Int, bitrate: Mp3Bitrate) {
         val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
         val pcmFile = File(cacheDir, "rekam_tmp_$timestamp.pcm")
+        var capturedBytes = 0L
 
         try {
             FileOutputStream(pcmFile).use { outputStream ->
                 val buffer = ByteArray(bufferSize)
                 while (isRecording) {
-                    val readResult = audioRecord?.read(buffer, 0, bufferSize) ?: 0
+                    val readResult = readAudioChunk(buffer, bufferSize, "mp3")
+                    if (readResult < 0 && isCaptureBroken()) {
+                        Log.e("AudioCaptureService", "Aborting MP3 capture: AudioRecord unrecoverable")
+                        break
+                    }
                     if (readResult > 0) {
                         outputStream.write(buffer, 0, readResult)
+                        capturedBytes += readResult
                     }
                 }
+                outputStream.flush()
             }
         } catch (t: Throwable) {
             Log.e("AudioCaptureService", "Error capturing PCM for MP3", t)
-            pcmFile.delete()
-            return
+            if (pcmFile.length() == 0L) {
+                pcmFile.delete()
+                reportCaptureFailure(
+                    getString(R.string.capture_failed_title),
+                    t.javaClass.simpleName + ": " + t.message
+                )
+                return
+            }
         }
 
         if (pcmFile.length() == 0L) {
+            // Never drop the session silently: tell the user nothing was captured
+            // instead of letting them believe a long recording is safe.
+            Log.e("AudioCaptureService", "MP3 capture produced 0 bytes (captured=$capturedBytes)")
             pcmFile.delete()
+            reportCaptureFailure(
+                getString(R.string.capture_failed_title),
+                getString(R.string.capture_failed_text)
+            )
             return
         }
 
@@ -490,102 +600,196 @@ class AudioCaptureService : Service() {
 
     /**
      * Real-time streaming MP3 encoding using a named pipe (FIFO).
-     * PCM data is written to the FIFO while ffmpeg reads from it and encodes
-     * to MP3 simultaneously. This avoids the post-recording transcode wait.
-     * Only supports 128 and 192 kbps (320 kbps is too heavy for real-time).
-     * Falls back to standard async encoding if FIFO creation fails.
+     *
+     * The raw PCM is ALWAYS written to a temp file alongside the FIFO. The live
+     * pipe is only an optimisation: if ffmpeg fails to start, the pipe stalls or
+     * back-pressures, the recording keeps landing on disk and is encoded after
+     * the fact instead of being lost. Every blocking step here is bounded so a
+     * dead ffmpeg can never freeze the capture loop.
      */
     private fun recordMp3Streaming(bufferSize: Int, bitrate: Mp3Bitrate) {
         val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
         val fifoFile = File(cacheDir, "rekam_fifo_$timestamp")
+        val pcmFile = File(cacheDir, "rekam_tmp_$timestamp.pcm")
         val mp3File = File(cacheDir, "rekam_tmp_$timestamp.mp3")
 
         try {
-            // Create a named pipe for real-time streaming
-            try {
-                Os.mkfifo(fifoFile.absolutePath, 0x1B6) // octal 0666
-            } catch (e: ErrnoException) {
-                Log.e("AudioCaptureService", "FIFO creation failed, falling back to async encoding", e)
-                fifoFile.delete()
-                // Fall back to the standard post-recording approach
-                recordMp3Audio(bufferSize, bitrate)
-                return
-            }
+            Os.mkfifo(fifoFile.absolutePath, 0x1B6) // octal 0666
+        } catch (e: ErrnoException) {
+            Log.e("AudioCaptureService", "FIFO creation failed, using file capture", e)
+            recordMp3Audio(bufferSize, bitrate)
+            return
+        }
 
-            // Show recording state (pulse animation), NOT encoding ring
-            android.os.Handler(android.os.Looper.getMainLooper()).post {
-                overlayManager.updateState(true)
-            }
-            updateEncodingNotification(0f)
+        val state = StreamState()
+        val encodeDone = CountDownLatch(1)
+        val fifoQueue = ArrayBlockingQueue<ByteArray>(FIFO_QUEUE_CAPACITY)
+
+        var pcmOut: FileOutputStream? = null
+        var fifoOut: java.io.OutputStream? = null
+        var writer: Thread? = null
+        var capturedBytes = 0L
+        var handedOffToEncoder = false
+
+        try {
+            val pcmSink = FileOutputStream(pcmFile)
+            pcmOut = pcmSink
+            withMainThread { overlayManager.updateState(true) }
 
             val command = "-y -f s16le -ar $SAMPLE_RATE -ac $CHANNEL_COUNT " +
                 "-i ${fifoFile.absolutePath} -codec:a libmp3lame -b:a ${bitrate.bitsPerSecond} ${mp3File.absolutePath}"
 
-            // Use a latch to track if ffmpeg has opened the FIFO for reading
-            val fifoReady = java.util.concurrent.CountDownLatch(1)
-            var recordingStarted = false
-
-            // Start ffmpeg reading from the FIFO (runs on ffmpeg-kit's own thread)
-            FFmpegKit.executeAsync(
+            val streamSession = FFmpegKit.executeAsync(
                 command,
                 { session ->
-                    // Completion callback runs on ffmpeg-kit's executor thread.
-                    try {
-                        if (ReturnCode.isSuccess(session.returnCode)) {
-                            copyFileToMediaStore(mp3File, "recording_$timestamp.mp3", "audio/mpeg")
-                            Log.d("AudioCaptureService", "Streaming MP3 encode succeeded")
-                        } else {
-                            val detail = extractSessionError(session)
-                            Log.e("AudioCaptureService", "Streaming MP3 encode failed: rc=${session.returnCode} $detail")
-                            showEncodeErrorNotification(detail, false)
-                        }
-                    } catch (t: Throwable) {
-                        Log.e("AudioCaptureService", "Error finishing streaming MP3", t)
-                        showEncodeErrorNotification("${t.javaClass.simpleName}: ${t.message}", false)
-                    } finally {
-                        fifoFile.delete()
-                        mp3File.delete()
-                        overlayManager.hideEncoding()
-                        restoreIdleNotification()
+                    state.encodeSucceeded.set(ReturnCode.isSuccess(session.returnCode))
+                    if (!state.encodeSucceeded.get()) {
+                        Log.e(
+                            "AudioCaptureService",
+                            "Streaming MP3 encode failed: rc=${session.returnCode} ${extractSessionError(session)}"
+                        )
                     }
+                    encodeDone.countDown()
                 },
                 { /* logs ignored */ },
-                null // No progress statistics callback for streaming
+                null
             )
 
-            // Give ffmpeg time to start and open the FIFO for reading
-            Thread.sleep(300)
+            // O_RDWR never blocks on a FIFO. Opening O_WRONLY without a reader
+            // blocks forever, which used to freeze the capture loop and throw
+            // away an entire recording when ffmpeg failed to start.
+            val fifoFd = Os.open(fifoFile.absolutePath, OsConstants.O_RDWR, 0)
+            val sink = FileOutputStream(fifoFd)
+            fifoOut = sink
 
-            // Open the FIFO for writing. This blocks until the reader (ffmpeg)
-            // opens it for reading, which should already be the case after the delay.
-            FileOutputStream(fifoFile).use { outputStream ->
-                recordingStarted = true
-                fifoReady.countDown()
-                val buffer = ByteArray(bufferSize)
-                while (isRecording) {
-                    val readResult = audioRecord?.read(buffer, 0, bufferSize) ?: 0
-                    if (readResult > 0) {
-                        outputStream.write(buffer, 0, readResult)
+            writer = Thread {
+                try {
+                    // Exits as soon as the feed is closed, after having drained
+                    // everything the capture loop already queued.
+                    while (!state.feedClosed.get()) {
+                        val chunk = fifoQueue.poll(200, TimeUnit.MILLISECONDS) ?: continue
+                        sink.write(chunk)
+                    }
+                } catch (t: Throwable) {
+                    Log.e("AudioCaptureService", "FIFO writer stopped, falling back to file capture", t)
+                    state.stalled.set(true)
+                }
+            }.apply {
+                isDaemon = true
+                name = "rekam-fifo-writer"
+                start()
+            }
+
+            val buffer = ByteArray(bufferSize)
+            while (isRecording) {
+                val readResult = readAudioChunk(buffer, bufferSize, "mp3-stream")
+                if (readResult < 0 && isCaptureBroken()) {
+                    Log.e("AudioCaptureService", "Aborting streaming MP3 capture: AudioRecord unrecoverable")
+                    break
+                }
+                if (readResult <= 0) continue
+
+                // Disk copy first: it must survive whatever the pipe does.
+                pcmSink.write(buffer, 0, readResult)
+                capturedBytes += readResult
+
+                if (!state.stalled.get()) {
+                    val copy = buffer.copyOf(readResult)
+                    if (!fifoQueue.offer(copy, FIFO_OFFER_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                        Log.w("AudioCaptureService", "FIFO back-pressure detected, keeping file capture")
+                        state.stalled.set(true)
+                        fifoQueue.clear()
                     }
                 }
             }
-            // The FIFO closes with FileOutputStream.use {}, which sends EOF to ffmpeg.
-            // ffmpeg will now finish writing the MP3 file.
+            pcmSink.flush()
 
-            // Show encoding ring briefly while ffmpeg finishes writing
-            overlayManager.showEncoding()
+            // Let the pipe drain what is already queued so the MP3 does not
+            // lose its tail, then signal EOF so ffmpeg can flush and exit.
+            val drainDeadline = SystemClock.elapsedRealtime() + FIFO_DRAIN_TIMEOUT_MS
+            while (fifoQueue.isNotEmpty() &&
+                !state.stalled.get() &&
+                SystemClock.elapsedRealtime() < drainDeadline
+            ) {
+                Thread.sleep(20)
+            }
 
+            state.feedClosed.set(true)
+            runCatching { fifoOut?.close() }
+            runCatching { writer?.join(FIFO_JOIN_TIMEOUT_MS) }
+            fifoOut = null
+
+            withMainThread { overlayManager.showEncoding() }
+
+            val finished = runCatching { encodeDone.await(ENCODE_WAIT_SECONDS, TimeUnit.SECONDS) }
+                .getOrDefault(false)
+            val streamUsable = finished && state.encodeSucceeded.get() && !state.stalled.get()
+
+            if (streamUsable && mp3File.length() > 0L) {
+                copyFileToMediaStore(mp3File, "recording_$timestamp.mp3", "audio/mpeg")
+                Log.d("AudioCaptureService", "Streaming MP3 encode succeeded (${mp3File.length()} bytes)")
+                withMainThread { overlayManager.hideEncoding() }
+                restoreIdleNotification()
+                pcmFile.delete()
+                mp3File.delete()
+            } else if (capturedBytes > 0L && pcmFile.length() > 0L) {
+                // The pipe did not deliver a usable MP3 but the capture is intact.
+                Log.w(
+                    "AudioCaptureService",
+                    "Streaming path unusable (finished=$finished, stalled=${state.stalled.get()}), " +
+                        "encoding ${pcmFile.length()} bytes of PCM instead"
+                )
+                // Stop the streaming session first: it would otherwise keep
+                // writing the very same output file we are about to encode into.
+                runCatching { FFmpegKit.cancel(streamSession.sessionId) }
+                Thread.sleep(200)
+                handedOffToEncoder = true
+                encodeMp3Async(pcmFile, timestamp, bitrate)
+            } else {
+                Log.e("AudioCaptureService", "Streaming MP3 captured 0 bytes")
+                pcmFile.delete()
+                mp3File.delete()
+                withMainThread { overlayManager.hideEncoding() }
+                restoreIdleNotification()
+                reportCaptureFailure(
+                    getString(R.string.capture_failed_title),
+                    getString(R.string.capture_failed_text)
+                )
+            }
         } catch (t: Throwable) {
             Log.e("AudioCaptureService", "Error in streaming MP3 recording", t)
-            mp3File.delete()
-            overlayManager.hideEncoding()
-            restoreIdleNotification()
-            showEncodeErrorNotification("${t.javaClass.simpleName}: ${t.message}", false)
+            if (!handedOffToEncoder) {
+                if (capturedBytes > 0L && pcmFile.length() > 0L) {
+                    handedOffToEncoder = true
+                    withMainThread { overlayManager.showEncoding() }
+                    encodeMp3Async(pcmFile, timestamp, bitrate)
+                } else {
+                    pcmFile.delete()
+                    withMainThread { overlayManager.hideEncoding() }
+                    restoreIdleNotification()
+                    reportCaptureFailure(
+                        getString(R.string.capture_failed_title),
+                        t.javaClass.simpleName + ": " + t.message
+                    )
+                }
+            }
         } finally {
-            if (fifoFile.exists()) {
-                fifoFile.delete()
+            state.feedClosed.set(true)
+            runCatching { fifoOut?.close() }
+            runCatching { pcmOut?.close() }
+            runCatching { writer?.join(FIFO_JOIN_TIMEOUT_MS) }
+            runCatching { fifoFile.delete() }
+            if (!handedOffToEncoder) {
+                runCatching { mp3File.delete() }
             }
         }
+    }
+
+    /** Mutable state shared between the capture loop, the pipe writer and ffmpeg. */
+    private class StreamState {
+        val stalled = java.util.concurrent.atomic.AtomicBoolean(false)
+        val encodeSucceeded = java.util.concurrent.atomic.AtomicBoolean(false)
+        val feedClosed = java.util.concurrent.atomic.AtomicBoolean(false)
     }
 
     private fun encodeMp3Async(pcmFile: File, timestamp: String, bitrate: Mp3Bitrate) {
@@ -821,29 +1025,158 @@ class AudioCaptureService : Service() {
         contentResolver.update(uri, values, null, null)
     }
 
+    private fun withMainThread(block: () -> Unit) {
+        android.os.Handler(android.os.Looper.getMainLooper()).post(block)
+    }
+
+    /**
+     * Long recordings must keep the CPU awake. Without a wake lock the capture
+     * thread stops being scheduled once the screen turns off, the AudioRecord
+     * ring buffer overflows, and the user ends up with a silent empty file
+     * after recording for an hour.
+     */
+    private fun acquireWakeLock() {
+        if (wakeLock != null) return
+        try {
+            val powerManager = getSystemService(android.content.Context.POWER_SERVICE) as PowerManager
+            wakeLock = powerManager.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "$packageName:recording"
+            ).apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+            Log.d("AudioCaptureService", "Wake lock acquired")
+        } catch (t: Throwable) {
+            Log.e("AudioCaptureService", "Failed to acquire wake lock", t)
+        }
+    }
+
+    private fun releaseWakeLock() {
+        try {
+            wakeLock?.let { if (it.isHeld) it.release() }
+        } catch (t: Throwable) {
+            Log.e("AudioCaptureService", "Failed to release wake lock", t)
+        }
+        wakeLock = null
+    }
+
+    /**
+     * Reads one PCM chunk and turns silent AudioRecord failures into a loud,
+     * user-visible problem. Previously a negative return code was treated as
+     * "no data", so a dead audio source spun the loop forever and produced an
+     * empty recording without any signal to the user.
+     */
+    private fun readAudioChunk(buffer: ByteArray, size: Int, tag: String): Int {
+        val record = audioRecord ?: return AudioRecord.ERROR_INVALID_OPERATION
+        val result = try {
+            record.read(buffer, 0, size)
+        } catch (t: Throwable) {
+            Log.e("AudioCaptureService", "[$tag] AudioRecord.read threw", t)
+            AudioRecord.ERROR_INVALID_OPERATION
+        }
+        if (result < 0) {
+            consecutiveReadErrors++
+            Log.e(
+                "AudioCaptureService",
+                "[$tag] AudioRecord.read error=$result (consecutive=$consecutiveReadErrors)"
+            )
+            if (consecutiveReadErrors >= MAX_CONSECUTIVE_READ_ERRORS) {
+                notifyCaptureFailureOnce()
+            }
+        } else {
+            consecutiveReadErrors = 0
+            if (result > 0) totalBytesCaptured += result
+        }
+        return result
+    }
+
+    private fun isCaptureBroken(): Boolean =
+        consecutiveReadErrors >= MAX_CONSECUTIVE_READ_ERRORS
+
+    private fun notifyCaptureFailureOnce() {
+        if (captureFailureNotified) return
+        captureFailureNotified = true
+        reportCaptureFailure(
+            getString(R.string.capture_failed_title),
+            getString(R.string.capture_failed_text)
+        )
+    }
+
+    /**
+     * Surfaces a capture problem to the user. Silence is the worst possible
+     * outcome: they must learn right away that this session is not recording.
+     */
+    private fun reportCaptureFailure(title: String, detail: String) {
+        Log.e("AudioCaptureService", "Capture failure: $title / $detail")
+        withMainThread { overlayManager.updateState(false) }
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle(title)
+            .setContentText(detail)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(detail))
+            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setAutoCancel(true)
+            .build()
+        try {
+            notificationManager().notify(CAPTURE_ERROR_NOTIFICATION_ID, notification)
+        } catch (e: Exception) {
+            Log.e("AudioCaptureService", "Failed to show capture failure notification", e)
+        }
+    }
+
     private fun stopRecording() {
         isRecording = false
+        // Invalidate any half-finished setup so it can never resurrect a session
+        // the user already stopped.
+        sessionGeneration++
         getSharedPreferences(PREFS_NAME, android.content.Context.MODE_PRIVATE)
             .edit()
             .putBoolean(KEY_IS_RECORDING, false)
             .apply()
 
-        recordingJob?.cancel()
-        
+        val job = recordingJob
+        recordingJob = null
+        job?.cancel()
+
+        releaseWakeLock()
+
         try {
             audioRecord?.stop()
-            audioRecord?.release()
         } catch (e: Exception) {
              Log.e("AudioCaptureService", "Error stopping audioRecord", e)
         }
+        try {
+            audioRecord?.release()
+        } catch (e: Exception) {
+             Log.e("AudioCaptureService", "Error releasing audioRecord", e)
+        }
         audioRecord = null
-        
-        mediaProjection?.stop()
+
+        // A MediaProjection consent token is single-use. In overlay mode the
+        // projection must stay alive so the next recording can reuse it —
+        // stopping it here is what made every second recording come out empty.
+        if (!isOverlayMode) {
+            stopProjection()
+        }
+    }
+
+    private fun stopProjection() {
+        try {
+            mediaProjection?.stop()
+        } catch (e: Exception) {
+            Log.e("AudioCaptureService", "Error stopping mediaProjection", e)
+        }
         mediaProjection = null
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        // Whatever brought the service down, never leave a recording half-open
+        // or a wake lock behind.
+        stopRecording()
+        isOverlayMode = false
+        stopProjection()
+        releaseWakeLock()
         overlayManager.removeOverlay()
     }
 
@@ -871,6 +1204,19 @@ class AudioCaptureService : Service() {
         const val CHANNEL_ID = "AudioCaptureChannel"
         const val NOTIFICATION_ID = 1
         const val ENCODE_ERROR_NOTIFICATION_ID = 2
+        const val CAPTURE_ERROR_NOTIFICATION_ID = 3
+
+        /** How many consecutive AudioRecord.read() failures mark the source dead. */
+        private const val MAX_CONSECUTIVE_READ_ERRORS = 20
+
+        /** Bounded pipe queue so a stalled reader can never block the capture loop. */
+        private const val FIFO_QUEUE_CAPACITY = 32
+        private const val FIFO_OFFER_TIMEOUT_MS = 40L
+        private const val FIFO_JOIN_TIMEOUT_MS = 2000L
+        private const val FIFO_DRAIN_TIMEOUT_MS = 3000L
+
+        /** Upper bound on how long stop waits for ffmpeg to flush the MP3. */
+        private const val ENCODE_WAIT_SECONDS = 60L
         const val ACTION_START = "START"
         const val ACTION_STOP = "STOP"
         const val ACTION_SHOW_OVERLAY = "SHOW_OVERLAY"

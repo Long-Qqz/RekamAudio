@@ -60,6 +60,8 @@
     <string name="streaming_encoding">实时流式 MP3 编码</string>
     <string name="streaming_encoding_on">开启 – 边录边编码，仅支持 128/192 kbps</string>
     <string name="streaming_encoding_off">关闭 – 停止后统一编码</string>
+    <string name="capture_failed_title">这次没有录到声音</string>
+    <string name="capture_failed_text">系统本次没有提供内部音频，文件未保存。请重新授权屏幕录制权限后再试一次。</string>
     <string name="confirm">确定</string>
     <string name="cancel">取消</string>
 

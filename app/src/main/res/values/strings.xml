@@ -60,6 +60,8 @@
     <string name="streaming_encoding">Streaming MP3 encoding</string>
     <string name="streaming_encoding_on">On – encodes in real-time, supports 128/192 kbps</string>
     <string name="streaming_encoding_off">Off – encodes after stopping</string>
+    <string name="capture_failed_title">Nothing was recorded</string>
+    <string name="capture_failed_text">The system returned no internal audio for this session. The file was not saved. Please grant screen capture permission again and try once more.</string>
     <string name="confirm">Confirm</string>
     <string name="cancel">Cancel</string>
 

@@ -60,6 +60,8 @@
     <string name="streaming_encoding">即時串流 MP3 編碼</string>
     <string name="streaming_encoding_on">開啟 – 邊錄邊編碼，僅支援 128/192 kbps</string>
     <string name="streaming_encoding_off">關閉 – 停止後統一編碼</string>
+    <string name="capture_failed_title">這次沒有錄到聲音</string>
+    <string name="capture_failed_text">系統本次沒有提供內部音訊，檔案未儲存。請重新授權螢幕錄製權限後再試一次。</string>
     <string name="confirm">確定</string>
     <string name="cancel">取消</string>
 
