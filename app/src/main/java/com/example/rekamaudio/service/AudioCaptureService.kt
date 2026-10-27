@@ -632,7 +632,7 @@ class AudioCaptureService : Service() {
         val finalized = java.util.concurrent.atomic.AtomicBoolean(false)
 
         var pcmOut: FileOutputStream? = null
-        var fifoOut: java.io.OutputStream? = null
+        var fifoFdRef: java.io.FileDescriptor? = null
         var writer: Thread? = null
 
         /**
@@ -720,20 +720,46 @@ class AudioCaptureService : Service() {
                 }
             )
 
-            // O_RDWR never blocks on a FIFO. Opening O_WRONLY without a reader
-            // blocks forever, which used to freeze the capture loop and throw
-            // away an entire recording when ffmpeg failed to start.
-            val fifoFd = Os.open(fifoFile.absolutePath, OsConstants.O_RDWR, 0)
-            val sink = FileOutputStream(fifoFd)
-            fifoOut = sink
+            // O_NONBLOCK is what makes shutdown deterministic. A blocking write
+            // leaves this thread stuck inside write(), the pipe's writer count
+            // never reaches zero, ffmpeg waits for an EOF that never arrives and
+            // the whole recording appears frozen. Non-blocking writes mean the
+            // thread always makes progress and always exits.
+            val fifoFd = Os.open(
+                fifoFile.absolutePath,
+                OsConstants.O_RDWR or OsConstants.O_NONBLOCK,
+                0
+            )
+            fifoFdRef = fifoFd
 
             writer = Thread {
                 try {
-                    // Exits as soon as the feed is closed, after having drained
-                    // everything the capture loop already queued.
                     while (!state.feedClosed.get()) {
-                        val chunk = fifoQueue.poll(200, TimeUnit.MILLISECONDS) ?: continue
-                        sink.write(chunk)
+                        val chunk = fifoQueue.poll(FIFO_POLL_MS, TimeUnit.MILLISECONDS) ?: continue
+                        var offset = 0
+                        var idleTries = 0
+                        while (offset < chunk.size && !state.feedClosed.get()) {
+                            val written = try {
+                                Os.write(fifoFd, chunk, offset, chunk.size - offset)
+                            } catch (e: ErrnoException) {
+                                if (e.errno == OsConstants.EAGAIN) 0 else throw e
+                            }
+                            if (written > 0) {
+                                offset += written
+                                idleTries = 0
+                            } else {
+                                // Pipe is full because ffmpeg stopped draining.
+                                if (++idleTries >= FIFO_MAX_IDLE_TRIES) {
+                                    Log.w(
+                                        "AudioCaptureService",
+                                        "FIFO reader stopped draining, keeping file capture"
+                                    )
+                                    state.stalled.set(true)
+                                    return@Thread
+                                }
+                                Thread.sleep(FIFO_RETRY_SLEEP_MS)
+                            }
+                        }
                     }
                 } catch (t: Throwable) {
                     // Exceptions after we deliberately closed the pipe are part
@@ -759,8 +785,20 @@ class AudioCaptureService : Service() {
                 }
                 if (readResult <= 0) continue
 
-                // Disk copy first: it must survive whatever the pipe does.
-                pcmSink.write(buffer, 0, readResult)
+                // Disk copy first: it must survive whatever the pipe does. A long
+                // recording can exhaust cache space, so a failed backup write
+                // degrades to stream-only instead of aborting the whole session.
+                try {
+                    pcmSink.write(buffer, 0, readResult)
+                } catch (io: Throwable) {
+                    if (!state.pcmBroken.getAndSet(true)) {
+                        Log.e(
+                            "AudioCaptureService",
+                            "PCM backup write failed, continuing with the live stream only",
+                            io
+                        )
+                    }
+                }
                 state.capturedBytes.addAndGet(readResult.toLong())
 
                 if (!state.stalled.get()) {
@@ -787,12 +825,13 @@ class AudioCaptureService : Service() {
             }
 
             state.feedClosed.set(true)
-            // Let the writer finish the chunk it may already be sending before we
-            // tear the pipe down; closing underneath a live write would surface
-            // as a spurious "stalled" and force a needless full re-encode.
+            // Let the writer drain what is already queued. It can no longer be
+            // blocked, so this returns in at most one poll interval.
             runCatching { writer?.join(FIFO_JOIN_TIMEOUT_MS) }
-            runCatching { fifoOut?.close() }
-            fifoOut = null
+            // Closing is now safe: no thread is inside a write(), so the pipe's
+            // writer count really reaches zero and ffmpeg sees EOF at once.
+            runCatching { Os.close(fifoFd) }
+            fifoFdRef = null
 
             // Show the finishing progress bar and hand off to ffmpeg.
             withMainThread { overlayManager.showEncoding() }
@@ -824,7 +863,7 @@ class AudioCaptureService : Service() {
             finalizeStream(false)
         } finally {
             state.feedClosed.set(true)
-            runCatching { fifoOut?.close() }
+            runCatching { fifoFdRef?.let { Os.close(it) } }
             runCatching { pcmOut?.close() }
             runCatching { writer?.join(FIFO_JOIN_TIMEOUT_MS) }
             runCatching { fifoFile.delete() }
@@ -837,6 +876,7 @@ class AudioCaptureService : Service() {
         val encodeSucceeded = java.util.concurrent.atomic.AtomicBoolean(false)
         val feedClosed = java.util.concurrent.atomic.AtomicBoolean(false)
         val capturedBytes = java.util.concurrent.atomic.AtomicLong(0L)
+        val pcmBroken = java.util.concurrent.atomic.AtomicBoolean(false)
     }
 
     /**
@@ -1270,11 +1310,14 @@ class AudioCaptureService : Service() {
         /** Bounded pipe queue so a stalled reader can never block the capture loop. */
         private const val FIFO_QUEUE_CAPACITY = 32
         private const val FIFO_OFFER_TIMEOUT_MS = 40L
-        private const val FIFO_JOIN_TIMEOUT_MS = 1000L
-        private const val FIFO_DRAIN_TIMEOUT_MS = 1500L
+        private const val FIFO_POLL_MS = 50L
+        private const val FIFO_JOIN_TIMEOUT_MS = 400L
+        private const val FIFO_DRAIN_TIMEOUT_MS = 800L
+        private const val FIFO_RETRY_SLEEP_MS = 15L
+        private const val FIFO_MAX_IDLE_TRIES = 100
 
         /** How long the stop path waits for ffmpeg before cancelling it outright. */
-        private const val STREAM_FINISH_GRACE_SECONDS = 6L
+        private const val STREAM_FINISH_GRACE_SECONDS = 4L
 
         /** Upper bound on waiting for the capture loop before releasing the device. */
         private const val AUDIO_RELEASE_TIMEOUT_MS = 1500L
