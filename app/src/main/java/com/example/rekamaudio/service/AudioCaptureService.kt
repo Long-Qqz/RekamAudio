@@ -624,12 +624,60 @@ class AudioCaptureService : Service() {
         val state = StreamState()
         val encodeDone = CountDownLatch(1)
         val fifoQueue = ArrayBlockingQueue<ByteArray>(FIFO_QUEUE_CAPACITY)
+        // Set once the capture loop is done and the pipe has been closed.
+        val captureFinished = java.util.concurrent.atomic.AtomicBoolean(false)
+        // Guarantees the tail work runs exactly once, from whichever thread
+        // (ffmpeg callback, watchdog or the stop path) gets there first.
+        val finalized = java.util.concurrent.atomic.AtomicBoolean(false)
 
         var pcmOut: FileOutputStream? = null
         var fifoOut: java.io.OutputStream? = null
         var writer: Thread? = null
-        var capturedBytes = 0L
-        var handedOffToEncoder = false
+
+        /**
+         * Turns the finished stream into a saved recording. This never blocks
+         * the stop path: while ffmpeg is still flushing, its own completion
+         * callback calls in here instead.
+         */
+        fun finalizeStream(streamOk: Boolean) {
+            if (!finalized.compareAndSet(false, true)) return
+            try {
+                if (streamOk && !state.stalled.get() && mp3File.length() > 0L) {
+                    copyFileToMediaStore(mp3File, "recording_$timestamp.mp3", "audio/mpeg")
+                    Log.d("AudioCaptureService", "Streaming MP3 saved (${mp3File.length()} bytes)")
+                    withMainThread { overlayManager.hideEncoding() }
+                    restoreIdleNotification()
+                    pcmFile.delete()
+                    mp3File.delete()
+                } else if (pcmFile.length() > 0L) {
+                    Log.w(
+                        "AudioCaptureService",
+                        "Streaming path unusable (ok=$streamOk, stalled=${state.stalled.get()}), " +
+                            "encoding ${pcmFile.length()} bytes of PCM backup"
+                    )
+                    withMainThread { overlayManager.showEncoding() }
+                    encodeMp3Async(pcmFile, timestamp, bitrate)
+                } else {
+                    Log.e("AudioCaptureService", "Streaming MP3 captured 0 bytes")
+                    pcmFile.delete()
+                    mp3File.delete()
+                    withMainThread { overlayManager.hideEncoding() }
+                    restoreIdleNotification()
+                    reportCaptureFailure(
+                        getString(R.string.capture_failed_title),
+                        getString(R.string.capture_failed_text)
+                    )
+                }
+            } catch (t: Throwable) {
+                Log.e("AudioCaptureService", "Error finalising streaming MP3", t)
+                withMainThread { overlayManager.hideEncoding() }
+                restoreIdleNotification()
+                reportCaptureFailure(
+                    getString(R.string.capture_failed_title),
+                    t.javaClass.simpleName + ": " + t.message
+                )
+            }
+        }
 
         try {
             val pcmSink = FileOutputStream(pcmFile)
@@ -639,17 +687,21 @@ class AudioCaptureService : Service() {
             val command = "-y -f s16le -ar $SAMPLE_RATE -ac $CHANNEL_COUNT " +
                 "-i ${fifoFile.absolutePath} -codec:a libmp3lame -b:a ${bitrate.bitsPerSecond} ${mp3File.absolutePath}"
 
-            val streamSession = FFmpegKit.executeAsync(
+            FFmpegKit.executeAsync(
                 command,
                 { session ->
-                    state.encodeSucceeded.set(ReturnCode.isSuccess(session.returnCode))
-                    if (!state.encodeSucceeded.get()) {
+                    val ok = ReturnCode.isSuccess(session.returnCode)
+                    state.encodeSucceeded.set(ok)
+                    if (!ok) {
                         Log.e(
                             "AudioCaptureService",
                             "Streaming MP3 encode failed: rc=${session.returnCode} ${extractSessionError(session)}"
                         )
                     }
                     encodeDone.countDown()
+                    // Fast path: the user already pressed stop, so finish the
+                    // hand-off right here rather than making them wait.
+                    if (captureFinished.get()) finalizeStream(ok)
                 },
                 { /* logs ignored */ },
                 null
@@ -671,8 +723,13 @@ class AudioCaptureService : Service() {
                         sink.write(chunk)
                     }
                 } catch (t: Throwable) {
-                    Log.e("AudioCaptureService", "FIFO writer stopped, falling back to file capture", t)
-                    state.stalled.set(true)
+                    // Exceptions after we deliberately closed the pipe are part
+                    // of shutting down. Only a failure while we still wanted to
+                    // stream means the pipe is genuinely broken.
+                    if (!state.feedClosed.get()) {
+                        Log.e("AudioCaptureService", "FIFO writer stopped, falling back to file capture", t)
+                        state.stalled.set(true)
+                    }
                 }
             }.apply {
                 isDaemon = true
@@ -691,7 +748,6 @@ class AudioCaptureService : Service() {
 
                 // Disk copy first: it must survive whatever the pipe does.
                 pcmSink.write(buffer, 0, readResult)
-                capturedBytes += readResult
 
                 if (!state.stalled.get()) {
                     val copy = buffer.copyOf(readResult)
@@ -703,8 +759,10 @@ class AudioCaptureService : Service() {
                 }
             }
             pcmSink.flush()
+            pcmOut?.close()
+            pcmOut = null
 
-            // Let the pipe drain what is already queued so the MP3 does not
+            // Let the pipe drain whatever is still queued so the MP3 does not
             // lose its tail, then signal EOF so ffmpeg can flush and exit.
             val drainDeadline = SystemClock.elapsedRealtime() + FIFO_DRAIN_TIMEOUT_MS
             while (fifoQueue.isNotEmpty() &&
@@ -715,73 +773,49 @@ class AudioCaptureService : Service() {
             }
 
             state.feedClosed.set(true)
-            runCatching { fifoOut?.close() }
+            // Let the writer finish the chunk it may already be sending before we
+            // tear the pipe down; closing underneath a live write would surface
+            // as a spurious "stalled" and force a needless full re-encode.
             runCatching { writer?.join(FIFO_JOIN_TIMEOUT_MS) }
+            runCatching { fifoOut?.close() }
             fifoOut = null
 
+            // The audio was encoded while recording, so there is nothing left to
+            // wait for: show the finishing ring and let ffmpeg's callback save
+            // the file. Pressing stop now returns almost immediately.
             withMainThread { overlayManager.showEncoding() }
+            captureFinished.set(true)
+            if (encodeDone.count == 0L) {
+                finalizeStream(state.encodeSucceeded.get())
+            }
 
-            val finished = runCatching { encodeDone.await(ENCODE_WAIT_SECONDS, TimeUnit.SECONDS) }
-                .getOrDefault(false)
-            val streamUsable = finished && state.encodeSucceeded.get() && !state.stalled.get()
-
-            if (streamUsable && mp3File.length() > 0L) {
-                copyFileToMediaStore(mp3File, "recording_$timestamp.mp3", "audio/mpeg")
-                Log.d("AudioCaptureService", "Streaming MP3 encode succeeded (${mp3File.length()} bytes)")
-                withMainThread { overlayManager.hideEncoding() }
-                restoreIdleNotification()
-                pcmFile.delete()
-                mp3File.delete()
-            } else if (capturedBytes > 0L && pcmFile.length() > 0L) {
-                // The pipe did not deliver a usable MP3 but the capture is intact.
-                Log.w(
-                    "AudioCaptureService",
-                    "Streaming path unusable (finished=$finished, stalled=${state.stalled.get()}), " +
-                        "encoding ${pcmFile.length()} bytes of PCM instead"
-                )
-                // Stop the streaming session first: it would otherwise keep
-                // writing the very same output file we are about to encode into.
-                runCatching { FFmpegKit.cancel(streamSession.sessionId) }
-                Thread.sleep(200)
-                handedOffToEncoder = true
-                encodeMp3Async(pcmFile, timestamp, bitrate)
-            } else {
-                Log.e("AudioCaptureService", "Streaming MP3 captured 0 bytes")
-                pcmFile.delete()
-                mp3File.delete()
-                withMainThread { overlayManager.hideEncoding() }
-                restoreIdleNotification()
-                reportCaptureFailure(
-                    getString(R.string.capture_failed_title),
-                    getString(R.string.capture_failed_text)
-                )
+            // Safety net: a wedged ffmpeg must never leave the ring spinning.
+            Thread {
+                try {
+                    if (!encodeDone.await(FINALIZE_WATCHDOG_SECONDS, TimeUnit.SECONDS)) {
+                        Log.e("AudioCaptureService", "ffmpeg never finished the streaming encode")
+                        finalizeStream(false)
+                    }
+                } catch (e: InterruptedException) {
+                    // Nothing to recover from; the recording is already safe.
+                }
+            }.apply {
+                isDaemon = true
+                name = "rekam-stream-watchdog"
+                start()
             }
         } catch (t: Throwable) {
             Log.e("AudioCaptureService", "Error in streaming MP3 recording", t)
-            if (!handedOffToEncoder) {
-                if (capturedBytes > 0L && pcmFile.length() > 0L) {
-                    handedOffToEncoder = true
-                    withMainThread { overlayManager.showEncoding() }
-                    encodeMp3Async(pcmFile, timestamp, bitrate)
-                } else {
-                    pcmFile.delete()
-                    withMainThread { overlayManager.hideEncoding() }
-                    restoreIdleNotification()
-                    reportCaptureFailure(
-                        getString(R.string.capture_failed_title),
-                        t.javaClass.simpleName + ": " + t.message
-                    )
-                }
-            }
+            runCatching { pcmOut?.flush() }
+            state.stalled.set(true)
+            captureFinished.set(true)
+            finalizeStream(false)
         } finally {
             state.feedClosed.set(true)
             runCatching { fifoOut?.close() }
             runCatching { pcmOut?.close() }
             runCatching { writer?.join(FIFO_JOIN_TIMEOUT_MS) }
             runCatching { fifoFile.delete() }
-            if (!handedOffToEncoder) {
-                runCatching { mp3File.delete() }
-            }
         }
     }
 
@@ -1212,11 +1246,11 @@ class AudioCaptureService : Service() {
         /** Bounded pipe queue so a stalled reader can never block the capture loop. */
         private const val FIFO_QUEUE_CAPACITY = 32
         private const val FIFO_OFFER_TIMEOUT_MS = 40L
-        private const val FIFO_JOIN_TIMEOUT_MS = 2000L
-        private const val FIFO_DRAIN_TIMEOUT_MS = 3000L
+        private const val FIFO_JOIN_TIMEOUT_MS = 1000L
+        private const val FIFO_DRAIN_TIMEOUT_MS = 1500L
 
-        /** Upper bound on how long stop waits for ffmpeg to flush the MP3. */
-        private const val ENCODE_WAIT_SECONDS = 60L
+        /** Last-resort guard so ffmpeg can never leave the encoding ring stuck. */
+        private const val FINALIZE_WATCHDOG_SECONDS = 120L
         const val ACTION_START = "START"
         const val ACTION_STOP = "STOP"
         const val ACTION_SHOW_OVERLAY = "SHOW_OVERLAY"
