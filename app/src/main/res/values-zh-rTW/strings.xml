@@ -62,8 +62,8 @@
     <string name="streaming_encoding_off">關閉 – 停止後統一編碼</string>
     <string name="capture_failed_title">這次沒有錄到聲音</string>
     <string name="capture_failed_text">系統本次沒有提供內部音訊，檔案未儲存。請重新授權螢幕錄製權限後再試一次。</string>
-    <string name="capture_silent_title">偵測不到聲音，可能沒在錄音</string>
-    <string name="capture_silent_text">已經有一段時間沒有擷取到任何音訊了。請確認目前確實有聲音在播放，然後停止後重新開始。若持續無聲音，錄音會自動停止。</string>
+    <string name="capture_silent_title">暫時沒有擷取到聲音</string>
+    <string name="capture_silent_text">錄音仍在繼續，但系統目前沒有輸出內部音訊，這段會以靜音儲存。請確認有聲音在播放，開始播放後會自動繼續錄入。</string>
     <string name="capture_partial_text">已錄到的部分會正常儲存，但之後可能不再錄音。請停止後重新開始錄音。</string>
     <string name="about_category">關於</string>
     <string name="app_version">應用程式版本</string>

@@ -24,10 +24,14 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Mic
@@ -78,7 +82,58 @@ class OverlayManager(private val context: Context) {
     // State to drive the Compose UI
     private var buttonState by mutableStateOf(OverlayButtonState.IDLE)
     private var encodeProgress by mutableStateOf(0f)
+    private var warningMessage by mutableStateOf<String?>(null)
+    private var warningExpanded = false
     private var lifecycleOwner: OverlayLifecycleOwner? = null
+
+    fun isShowing(): Boolean = isOverlayShown
+
+    /**
+     * Shows a short hint next to the floating button. The overlay window grows to
+     * the left, and its x position is shifted by the same amount so the button
+     * itself does not jump while the hint appears or disappears.
+     */
+    fun showWarning(message: String) {
+        if (warningMessage == message) return
+        val wasExpanded = warningExpanded
+        warningMessage = message
+        if (!wasExpanded) {
+            warningExpanded = true
+            shiftAnchor(-warningWidthPx())
+        }
+    }
+
+    fun hideWarning() {
+        if (warningMessage == null) return
+        warningMessage = null
+        if (warningExpanded) {
+            warningExpanded = false
+            shiftAnchor(warningWidthPx())
+        }
+    }
+
+    private fun warningWidthPx(): Int {
+        val density = context.resources.displayMetrics.density
+        return ((WARNING_WIDTH_DP + WARNING_GAP_DP) * density).toInt()
+    }
+
+    private fun shiftAnchor(deltaX: Int) {
+        val params = windowParams ?: return
+        val view = overlayView ?: return
+        val wm = windowManager ?: return
+        val bounds = screenBounds()
+        val viewWidth = if (view.width > 0) {
+            view.width
+        } else {
+            (OVERLAY_WINDOW_SIZE_DP * context.resources.displayMetrics.density).toInt()
+        }
+        params.x = (params.x + deltaX).coerceIn(0, (bounds.width() - viewWidth).coerceAtLeast(0))
+        try {
+            wm.updateViewLayout(view, params)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
 
     fun showOverlay(onRecordClick: () -> Unit, onStopClick: () -> Unit, onCloseClick: () -> Unit, isRecording: Boolean) {
         if (isOverlayShown) {
@@ -108,6 +163,7 @@ class OverlayManager(private val context: Context) {
                     OverlayContent(
                         buttonState = buttonState,
                         encodeProgress = encodeProgress,
+                        warningMessage = warningMessage,
                         onRecordClick = onRecordClick,
                         onStopClick = onStopClick,
                         onCloseClick = onCloseClick,
@@ -196,6 +252,8 @@ class OverlayManager(private val context: Context) {
                 windowParams = null
                 lifecycleOwner = null
                 isOverlayShown = false
+                warningMessage = null
+                warningExpanded = false
             } catch (e: Exception) {
                 e.printStackTrace()
             }
@@ -246,10 +304,16 @@ private val OVERLAY_WINDOW_SIZE = 80.dp
 private val BUTTON_SIZE = 52.dp
 private val BADGE_SIZE = 24.dp
 
+// Hint bubble shown to the left of the button. Shared with the window manager
+// so the x offset applied when it appears matches the space it takes up.
+private const val WARNING_WIDTH_DP = 150
+private const val WARNING_GAP_DP = 6
+
 @Composable
 private fun OverlayContent(
     buttonState: OverlayButtonState,
     encodeProgress: Float,
+    warningMessage: String?,
     onRecordClick: () -> Unit,
     onStopClick: () -> Unit,
     onCloseClick: () -> Unit,
@@ -262,10 +326,30 @@ private fun OverlayContent(
         label = "dragScale"
     )
 
-    Box(
-        contentAlignment = Alignment.Center,
-        modifier = Modifier.size(OVERLAY_WINDOW_SIZE)
-    ) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        if (warningMessage != null) {
+            Surface(
+                shape = RoundedCornerShape(12.dp),
+                color = MaterialTheme.colorScheme.errorContainer,
+                contentColor = MaterialTheme.colorScheme.onErrorContainer,
+                shadowElevation = 4.dp,
+                modifier = Modifier
+                    .width(WARNING_WIDTH_DP.dp)
+                    .padding(end = WARNING_GAP_DP.dp)
+            ) {
+                Text(
+                    text = warningMessage,
+                    style = MaterialTheme.typography.labelSmall,
+                    maxLines = 4,
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)
+                )
+            }
+        }
+
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier.size(OVERLAY_WINDOW_SIZE)
+        ) {
         // Pulsing halo while recording
         if (buttonState == OverlayButtonState.RECORDING) {
             val infiniteTransition = rememberInfiniteTransition(label = "recordingPulse")
@@ -431,6 +515,7 @@ private fun OverlayContent(
                     )
                 }
             }
+        }
         }
     }
 }

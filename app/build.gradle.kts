@@ -14,8 +14,8 @@ android {
         applicationId = "com.example.rekamaudio"
         minSdk = 29
         targetSdk = 35
-        versionCode = 10
-        versionName = "1.3.5"
+        versionCode = 11
+        versionName = "1.3.6"
 
         ndk {
             abiFilters += listOf("arm64-v8a")
