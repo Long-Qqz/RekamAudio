@@ -105,6 +105,10 @@ class AudioCaptureService : Service() {
     private var nextStallWarnAt = 0L
     @Volatile private var stallWarningActive = false
 
+    // Loudest sample seen this session; the only reliable signal that the
+    // capture is actually delivering sound rather than all-zero frames.
+    @Volatile private var sessionPeakAmplitude = 0
+
     // Direct buffer required by the non-blocking read overload. Reading without
     // blocking keeps the capture loop iterating even when the system delivers
     // nothing, so the watchdog below can actually run.
@@ -333,6 +337,7 @@ class AudioCaptureService : Service() {
                 lastTimelineFillAt = SystemClock.elapsedRealtime()
                 nextStallWarnAt = SystemClock.elapsedRealtime() + CAPTURE_STALL_WARN_MS
                 stallWarningActive = false
+                sessionPeakAmplitude = 0
                 pcmReadBuffer = ByteBuffer.allocateDirect(bufferSize)
 
                 isRecording = true
@@ -1233,10 +1238,13 @@ class AudioCaptureService : Service() {
             direct.get(buffer, 0, copied)
             consecutiveReadErrors = 0
             totalBytesCaptured += result
+            updatePeakAmplitude(buffer, copied)
             val now = SystemClock.elapsedRealtime()
             lastCaptureProgressAt = now
             lastTimelineFillAt = now
-            if (stallWarningActive) clearStallWarning()
+            if (stallWarningActive && sessionPeakAmplitude >= AUDIBLE_PEAK_THRESHOLD) {
+                clearStallWarning()
+            }
             return copied
         }
 
@@ -1245,21 +1253,48 @@ class AudioCaptureService : Service() {
             return result
         }
 
-        // Nothing delivered: pad the timeline with silence so the recording keeps
-        // running and its length stays true. This does not count as captured
-        // audio, so the watchdog still fires if a session never works at all.
+        // Nothing delivered right now. In non-blocking mode this happens all the
+        // time between real frames, so only a genuinely long gap is padded —
+        // padding every momentary empty read is what chopped recordings into
+        // audible fragments.
         val now = SystemClock.elapsedRealtime()
-        val gapMs = (now - lastTimelineFillAt).coerceIn(0L, MAX_SILENCE_GAP_MS)
-        var silenceBytes = ((gapMs * SAMPLE_RATE / 1000) * BYTES_PER_PCM_FRAME).toInt()
+        val gapMs = now - lastTimelineFillAt
+        if (gapMs < SILENCE_PAD_THRESHOLD_MS) {
+            Thread.sleep(EMPTY_READ_SLEEP_MS)
+            return 0
+        }
+
+        val padMs = gapMs.coerceAtMost(MAX_SILENCE_GAP_MS)
+        var silenceBytes = ((padMs * SAMPLE_RATE / 1000) * BYTES_PER_PCM_FRAME).toInt()
         silenceBytes = (silenceBytes / BYTES_PER_PCM_FRAME) * BYTES_PER_PCM_FRAME
         if (silenceBytes <= 0) {
-            Thread.sleep(READ_IDLE_SLEEP_MS)
+            Thread.sleep(EMPTY_READ_SLEEP_MS)
             return 0
         }
         val toFill = minOf(silenceBytes, size)
         java.util.Arrays.fill(buffer, 0, toFill, 0.toByte())
         lastTimelineFillAt = now
         return toFill
+    }
+
+    /**
+     * Tracks the loudest sample seen this session.
+     *
+     * "No sound" cannot be detected from byte counts: the system keeps handing
+     * back all-zero frames when nothing is playing, so a byte-based check looked
+     * healthy forever and never warned. Peak amplitude is what actually tells
+     * us whether any real audio arrived.
+     */
+    private fun updatePeakAmplitude(buffer: ByteArray, length: Int) {
+        var peak = sessionPeakAmplitude
+        var i = 0
+        while (i + 1 < length) {
+            val sample = ((buffer[i + 1].toInt() shl 8) or (buffer[i].toInt() and 0xFF)).toShort().toInt()
+            val magnitude = if (sample < 0) -sample else sample
+            if (magnitude > peak) peak = magnitude
+            i += 2
+        }
+        sessionPeakAmplitude = peak
     }
 
     private fun recordReadError(tag: String, code: Int, extra: String?) {
@@ -1290,8 +1325,9 @@ class AudioCaptureService : Service() {
      */
     private fun captureStallState(): Int {
         if (!isRecording) return STALL_NONE
-        // Working as intended: real audio has arrived at least once.
-        if (totalBytesCaptured > 0L) return STALL_NONE
+        // Real audio has been heard at least once: the pipeline works, and a
+        // quiet stretch afterwards is normal and must not nag the user.
+        if (sessionPeakAmplitude >= AUDIBLE_PEAK_THRESHOLD) return STALL_NONE
         if (SystemClock.elapsedRealtime() < nextStallWarnAt) return STALL_NONE
         nextStallWarnAt = SystemClock.elapsedRealtime() + CAPTURE_STALL_REWARN_MS
         return STALL_WARN
@@ -1474,11 +1510,23 @@ class AudioCaptureService : Service() {
         /** Pause after an empty or failed read so the loop cannot spin hot. */
         private const val READ_IDLE_SLEEP_MS = 100L
 
+        /** Shorter pause while simply waiting for the next frame to arrive. */
+        private const val EMPTY_READ_SLEEP_MS = 20L
+
         /** 16-bit stereo: one frame is 2 channels x 2 bytes. */
         private const val BYTES_PER_PCM_FRAME = 4
 
+        /**
+         * Gaps shorter than this are just normal frame timing. Padding them
+         * would insert silence between real chunks and chop the audio up.
+         */
+        private const val SILENCE_PAD_THRESHOLD_MS = 500L
+
         /** Cap on a single silence padding burst so a stall cannot inflate a file. */
         private const val MAX_SILENCE_GAP_MS = 2_000L
+
+        /** Peak amplitude above this counts as real audio (16-bit full scale). */
+        private const val AUDIBLE_PEAK_THRESHOLD = 32
 
         /** Warn the user when a session still has no real audio after this long. */
         private const val CAPTURE_STALL_WARN_MS = 30_000L
