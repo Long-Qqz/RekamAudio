@@ -62,6 +62,9 @@
     <string name="streaming_encoding_off">关闭 – 停止后统一编码</string>
     <string name="capture_failed_title">这次没有录到声音</string>
     <string name="capture_failed_text">系统本次没有提供内部音频，文件未保存。请重新授权屏幕录制权限后再试一次。</string>
+    <string name="capture_silent_title">检测不到声音，可能没在录音</string>
+    <string name="capture_silent_text">已经有一段时间没有采集到任何音频了。请确认当前确实有声音在播放，然后停止后重新开始。若持续无声音，录音会自动停止。</string>
+    <string name="capture_partial_text">已录到的部分会正常保存，但之后可能不再录音。请停止后重新开始录音。</string>
     <string name="about_category">关于</string>
     <string name="app_version">应用版本</string>
     <string name="confirm">确定</string>

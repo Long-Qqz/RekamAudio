@@ -62,6 +62,9 @@
     <string name="streaming_encoding_off">Off – encodes after stopping</string>
     <string name="capture_failed_title">Nothing was recorded</string>
     <string name="capture_failed_text">The system returned no internal audio for this session. The file was not saved. Please grant screen capture permission again and try once more.</string>
+    <string name="capture_silent_title">No audio is being captured</string>
+    <string name="capture_silent_text">Nothing has been recorded for a while. Make sure sound is actually playing, then stop and start again. Recording will stop automatically if this continues.</string>
+    <string name="capture_partial_text">The audio captured so far will still be saved, but nothing more may be recorded. Please stop and start again.</string>
     <string name="about_category">About</string>
     <string name="app_version">App version</string>
     <string name="confirm">Confirm</string>

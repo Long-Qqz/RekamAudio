@@ -67,7 +67,7 @@ class AudioCaptureService : Service() {
 
     private var mediaProjectionManager: MediaProjectionManager? = null
     private var mediaProjection: MediaProjection? = null
-    private var audioRecord: AudioRecord? = null
+    @Volatile private var audioRecord: AudioRecord? = null
     private var mediaCodec: MediaCodec? = null
     private var mediaMuxer: MediaMuxer? = null
     private var recordingJob: Job? = null
@@ -97,6 +97,12 @@ class AudioCaptureService : Service() {
     private var captureFailureNotified = false
 
     @Volatile private var totalBytesCaptured = 0L
+
+    // Wall-clock of the last chunk that actually contained audio. A session that
+    // never advances this is not recording anything, no matter what read()
+    // returns — that is how an hour can pass with an empty file.
+    @Volatile private var lastCaptureProgressAt = 0L
+    private var captureStallWarned = false
 
     override fun onCreate() {
         super.onCreate()
@@ -312,7 +318,9 @@ class AudioCaptureService : Service() {
                 // Reset per-session counters before the capture loops start.
                 consecutiveReadErrors = 0
                 captureFailureNotified = false
+                captureStallWarned = false
                 totalBytesCaptured = 0L
+                lastCaptureProgressAt = SystemClock.elapsedRealtime()
 
                 isRecording = true
                 acquireWakeLock()
@@ -387,6 +395,7 @@ class AudioCaptureService : Service() {
             var lastLogTime = 0L
 
             while (isRecording) {
+                if (handleCaptureStall("m4a")) break
                 // Read PCM data
                 val readResult = readAudioChunk(inputBuffer, bufferSize, "m4a")
                 if (readResult < 0 && isCaptureBroken()) {
@@ -510,6 +519,7 @@ class AudioCaptureService : Service() {
             val buffer = ByteArray(bufferSize)
             
             while (isRecording) {
+                if (handleCaptureStall("wav")) break
                 val readResult = readAudioChunk(buffer, bufferSize, "wav")
                 if (readResult < 0 && isCaptureBroken()) {
                     Log.e("AudioCaptureService", "Aborting WAV capture: AudioRecord unrecoverable")
@@ -560,6 +570,7 @@ class AudioCaptureService : Service() {
             FileOutputStream(pcmFile).use { outputStream ->
                 val buffer = ByteArray(bufferSize)
                 while (isRecording) {
+                    if (handleCaptureStall("mp3")) break
                     val readResult = readAudioChunk(buffer, bufferSize, "mp3")
                     if (readResult < 0 && isCaptureBroken()) {
                         Log.e("AudioCaptureService", "Aborting MP3 capture: AudioRecord unrecoverable")
@@ -778,6 +789,7 @@ class AudioCaptureService : Service() {
 
             val buffer = ByteArray(bufferSize)
             while (isRecording) {
+                if (handleCaptureStall("mp3-stream")) break
                 val readResult = readAudioChunk(buffer, bufferSize, "mp3-stream")
                 if (readResult < 0 && isCaptureBroken()) {
                     Log.e("AudioCaptureService", "Aborting streaming MP3 capture: AudioRecord unrecoverable")
@@ -1159,43 +1171,138 @@ class AudioCaptureService : Service() {
 
     /**
      * Reads one PCM chunk and turns silent AudioRecord failures into a loud,
-     * user-visible problem. Previously a negative return code was treated as
-     * "no data", so a dead audio source spun the loop forever and produced an
-     * empty recording without any signal to the user.
+     * user-visible problem.
+     *
+     * The important case is `read()` returning 0: with playback capture that
+     * happens whenever the system delivers no audio at all. Treating it as "no
+     * data yet" let the loop spin for an entire hour without ever capturing a
+     * byte, so a lack of progress is now tracked separately from error codes.
      */
     private fun readAudioChunk(buffer: ByteArray, size: Int, tag: String): Int {
-        val record = audioRecord ?: return AudioRecord.ERROR_INVALID_OPERATION
+        val record = audioRecord
+        if (record == null) {
+            // A missing device must count as a failure; otherwise this returns
+            // success-shaped "no data" forever and nothing is ever recorded.
+            recordReadError(tag, AudioRecord.ERROR_INVALID_OPERATION, "AudioRecord is null")
+            return AudioRecord.ERROR_INVALID_OPERATION
+        }
         val result = try {
             record.read(buffer, 0, size)
         } catch (t: Throwable) {
             Log.e("AudioCaptureService", "[$tag] AudioRecord.read threw", t)
-            AudioRecord.ERROR_INVALID_OPERATION
+            recordReadError(tag, AudioRecord.ERROR_INVALID_OPERATION, t.javaClass.simpleName)
+            return AudioRecord.ERROR_INVALID_OPERATION
         }
         if (result < 0) {
-            consecutiveReadErrors++
-            Log.e(
-                "AudioCaptureService",
-                "[$tag] AudioRecord.read error=$result (consecutive=$consecutiveReadErrors)"
-            )
-            if (consecutiveReadErrors >= MAX_CONSECUTIVE_READ_ERRORS) {
-                notifyCaptureFailureOnce()
-            }
+            recordReadError(tag, result, null)
         } else {
             consecutiveReadErrors = 0
-            if (result > 0) totalBytesCaptured += result
+            if (result > 0) {
+                totalBytesCaptured += result
+                lastCaptureProgressAt = SystemClock.elapsedRealtime()
+                if (captureStallWarned) {
+                    captureStallWarned = false
+                    Log.i("AudioCaptureService", "[$tag] Audio capture resumed")
+                }
+            } else {
+                // Nothing delivered. Do not burn the CPU spinning on it.
+                Thread.sleep(READ_IDLE_SLEEP_MS)
+            }
         }
         return result
+    }
+
+    private fun recordReadError(tag: String, code: Int, extra: String?) {
+        consecutiveReadErrors++
+        Log.e(
+            "AudioCaptureService",
+            "[$tag] AudioRecord.read error=$code (consecutive=$consecutiveReadErrors)" +
+                if (extra != null) " $extra" else ""
+        )
+        if (consecutiveReadErrors >= MAX_CONSECUTIVE_READ_ERRORS) {
+            notifyCaptureFailureOnce()
+        } else {
+            Thread.sleep(READ_IDLE_SLEEP_MS)
+        }
     }
 
     private fun isCaptureBroken(): Boolean =
         consecutiveReadErrors >= MAX_CONSECUTIVE_READ_ERRORS
 
+    /**
+     * True when the session has produced no audio at all for long enough that
+     * it cannot be a normal pause. This is the guard that turns "recorded for
+     * an hour and got nothing" into a failure the user hears about in two
+     * minutes instead of after losing the whole session.
+     */
+    private fun captureStallState(): Int {
+        if (!isRecording) return STALL_NONE
+        val last = lastCaptureProgressAt
+        if (last == 0L) return STALL_NONE
+        val silentFor = SystemClock.elapsedRealtime() - last
+        return when {
+            silentFor >= CAPTURE_STALL_ABORT_MS -> STALL_ABORT
+            silentFor >= CAPTURE_STALL_WARN_MS && !captureStallWarned -> {
+                captureStallWarned = true
+                STALL_WARN
+            }
+            else -> STALL_NONE
+        }
+    }
+
+    /**
+     * Called from every capture loop. Warns once when nothing has been captured
+     * for a while, and aborts the session when it is clearly dead, so a silent
+     * session can never run on for the full length of a long recording.
+     * Returns true when the loop should stop.
+     */
+    private fun handleCaptureStall(tag: String): Boolean {
+        return when (captureStallState()) {
+            STALL_WARN -> {
+                notifyCaptureStalled()
+                false
+            }
+            STALL_ABORT -> {
+                Log.e(
+                    "AudioCaptureService",
+                    "[$tag] Aborting: no audio captured for ${CAPTURE_STALL_ABORT_MS}ms"
+                )
+                notifyCaptureFailureOnce()
+                isRecording = false
+                true
+            }
+            else -> false
+        }
+    }
+
+    private fun notifyCaptureStalled() {
+        Log.e("AudioCaptureService", "No audio captured for ${CAPTURE_STALL_WARN_MS}ms")
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle(getString(R.string.capture_silent_title))
+            .setContentText(getString(R.string.capture_silent_text))
+            .setStyle(
+                NotificationCompat.BigTextStyle().bigText(getString(R.string.capture_silent_text))
+            )
+            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setAutoCancel(true)
+            .build()
+        try {
+            notificationManager().notify(CAPTURE_ERROR_NOTIFICATION_ID, notification)
+        } catch (e: Exception) {
+            Log.e("AudioCaptureService", "Failed to show silence warning", e)
+        }
+    }
+
     private fun notifyCaptureFailureOnce() {
         if (captureFailureNotified) return
         captureFailureNotified = true
+        // Never claim "nothing was saved" when audio did land on disk.
+        val partial = totalBytesCaptured > 0L
         reportCaptureFailure(
             getString(R.string.capture_failed_title),
-            getString(R.string.capture_failed_text)
+            getString(
+                if (partial) R.string.capture_partial_text else R.string.capture_failed_text
+            )
         )
     }
 
@@ -1306,6 +1413,19 @@ class AudioCaptureService : Service() {
 
         /** How many consecutive AudioRecord.read() failures mark the source dead. */
         private const val MAX_CONSECUTIVE_READ_ERRORS = 20
+
+        /** Pause after an empty or failed read so the loop cannot spin hot. */
+        private const val READ_IDLE_SLEEP_MS = 100L
+
+        /** Warn the user once this long passes with no audio at all. */
+        private const val CAPTURE_STALL_WARN_MS = 30_000L
+
+        /** Give up rather than burn an hour on a session that captures nothing. */
+        private const val CAPTURE_STALL_ABORT_MS = 120_000L
+
+        private const val STALL_NONE = 0
+        private const val STALL_WARN = 1
+        private const val STALL_ABORT = 2
 
         /** Bounded pipe queue so a stalled reader can never block the capture loop. */
         private const val FIFO_QUEUE_CAPACITY = 32
