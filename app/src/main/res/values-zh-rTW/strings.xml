@@ -65,6 +65,7 @@
     <string name="capture_silent_title">暫時沒有擷取到聲音</string>
     <string name="capture_silent_text">錄音仍在繼續，但系統目前沒有輸出內部音訊，這段會以靜音儲存。請確認有聲音在播放，開始播放後會自動繼續錄入。</string>
     <string name="capture_partial_text">已錄到的部分會正常儲存，但之後可能不再錄音。請停止後重新開始錄音。</string>
+    <string name="capture_partial_short">錄音中斷，已錄部分已儲存</string>
     <string name="about_category">關於</string>
     <string name="app_version">應用程式版本</string>
     <string name="confirm">確定</string>

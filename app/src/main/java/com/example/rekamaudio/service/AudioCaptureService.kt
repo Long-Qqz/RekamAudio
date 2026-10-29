@@ -104,6 +104,7 @@ class AudioCaptureService : Service() {
     @Volatile private var lastCaptureProgressAt = 0L
     private var nextStallWarnAt = 0L
     @Volatile private var stallWarningActive = false
+    @Volatile private var failureWarningActive = false
 
     // Loudest sample seen this session; the only reliable signal that the
     // capture is actually delivering sound rather than all-zero frames.
@@ -339,6 +340,8 @@ class AudioCaptureService : Service() {
                 stallWarningActive = false
                 sessionPeakAmplitude = 0
                 pcmReadBuffer = ByteBuffer.allocateDirect(bufferSize)
+                // A fresh session starts with a clean button.
+                clearAllOverlayWarnings()
 
                 isRecording = true
                 acquireWakeLock()
@@ -1390,7 +1393,9 @@ class AudioCaptureService : Service() {
         // Never claim "nothing was saved" when audio did land on disk.
         val partial = totalBytesCaptured > 0L
         reportCaptureFailure(
-            getString(R.string.capture_failed_title),
+            getString(
+                if (partial) R.string.capture_partial_short else R.string.capture_failed_title
+            ),
             getString(
                 if (partial) R.string.capture_partial_text else R.string.capture_failed_text
             )
@@ -1404,6 +1409,15 @@ class AudioCaptureService : Service() {
     private fun reportCaptureFailure(title: String, detail: String) {
         Log.e("AudioCaptureService", "Capture failure: $title / $detail")
         withMainThread { overlayManager.updateState(false) }
+        failureWarningActive = true
+
+        // Same channel as the silence hint: the floating button is where the
+        // user is looking, so a hint there beats a notification they may miss.
+        if (overlayManager.isShowing()) {
+            withMainThread { overlayManager.showWarning(title) }
+            return
+        }
+
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(title)
             .setContentText(detail)
@@ -1416,6 +1430,14 @@ class AudioCaptureService : Service() {
         } catch (e: Exception) {
             Log.e("AudioCaptureService", "Failed to show capture failure notification", e)
         }
+    }
+
+    /** Clears any hint left on the button, e.g. when a new session starts. */
+    private fun clearAllOverlayWarnings() {
+        failureWarningActive = false
+        stallWarningActive = false
+        withMainThread { overlayManager.hideWarning() }
+        runCatching { notificationManager().cancel(CAPTURE_ERROR_NOTIFICATION_ID) }
     }
 
     private fun stopRecording() {

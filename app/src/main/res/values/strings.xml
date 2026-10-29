@@ -65,6 +65,7 @@
     <string name="capture_silent_title">No sound captured yet</string>
     <string name="capture_silent_text">Recording is still running, but the system is not outputting internal audio right now — that stretch is saved as silence. Once something starts playing it resumes automatically.</string>
     <string name="capture_partial_text">The audio captured so far will still be saved, but nothing more may be recorded. Please stop and start again.</string>
+    <string name="capture_partial_short">Recording interrupted, captured part saved</string>
     <string name="about_category">About</string>
     <string name="app_version">App version</string>
     <string name="confirm">Confirm</string>

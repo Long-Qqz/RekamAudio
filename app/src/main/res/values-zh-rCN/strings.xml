@@ -65,6 +65,7 @@
     <string name="capture_silent_title">暂时没有采集到声音</string>
     <string name="capture_silent_text">录音仍在继续，但系统目前没有输出内部音频，这段会以静音保存。请确认有声音在播放，开始播放后会自动继续录入。</string>
     <string name="capture_partial_text">已录到的部分会正常保存，但之后可能不再录音。请停止后重新开始录音。</string>
+    <string name="capture_partial_short">录音中断，已录部分已保存</string>
     <string name="about_category">关于</string>
     <string name="app_version">应用版本</string>
     <string name="confirm">确定</string>
