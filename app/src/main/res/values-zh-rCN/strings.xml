@@ -63,7 +63,7 @@
     <string name="capture_failed_title">这次没有录到声音</string>
     <string name="capture_failed_text">系统本次没有提供内部音频，文件未保存。请重新授权屏幕录制权限后再试一次。</string>
     <string name="capture_silent_title">暂时没有采集到声音</string>
-    <string name="capture_silent_text">录音仍在继续，但系统目前没有输出内部音频，这段会以静音保存。请确认有声音在播放，开始播放后会自动继续录入。</string>
+    <string name="capture_silent_text">录音仍在继续，但系统目前没有输出内部音频，这段时间不会被记录。请确认有声音在播放，开始播放后会自动继续录入。</string>
     <string name="capture_partial_text">已录到的部分会正常保存，但之后可能不再录音。请停止后重新开始录音。</string>
     <string name="capture_partial_short">录音中断，已录部分已保存</string>
     <string name="about_category">关于</string>

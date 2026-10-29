@@ -115,10 +115,6 @@ class AudioCaptureService : Service() {
     // nothing, so the watchdog below can actually run.
     private var pcmReadBuffer: ByteBuffer? = null
 
-    // Last time anything (real audio or padded silence) went into the timeline,
-    // used to pad gaps so a recording stays continuous while nothing plays.
-    @Volatile private var lastTimelineFillAt = 0L
-
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
@@ -335,7 +331,6 @@ class AudioCaptureService : Service() {
                 captureFailureNotified = false
                 totalBytesCaptured = 0L
                 lastCaptureProgressAt = SystemClock.elapsedRealtime()
-                lastTimelineFillAt = SystemClock.elapsedRealtime()
                 nextStallWarnAt = SystemClock.elapsedRealtime() + CAPTURE_STALL_WARN_MS
                 stallWarningActive = false
                 sessionPeakAmplitude = 0
@@ -667,6 +662,47 @@ class AudioCaptureService : Service() {
         var fifoFdRef: java.io.FileDescriptor? = null
         var writer: Thread? = null
 
+        // The MP3 target. When it can be opened directly in the media library,
+        // ffmpeg writes there as it encodes, so a process kill during a long
+        // recording still leaves everything that had been captured so far.
+        // Falls back to a cache file (copied at the end) if that is not possible.
+        var targetUri: Uri? = null
+        var targetPfd: ParcelFileDescriptor? = null
+        val outputPath: String
+
+        targetUri = createMp3Entry(timestamp)
+        if (targetUri != null) {
+            targetPfd = runCatching { contentResolver.openFileDescriptor(targetUri!!, "w") }
+                .onFailure { Log.e("AudioCaptureService", "Cannot open MP3 target", it) }
+                .getOrNull()
+        }
+        outputPath = if (targetPfd != null) {
+            "/proc/self/fd/${targetPfd.fd}"
+        } else {
+            runCatching { contentResolver.delete(targetUri!!, null, null) }
+            targetUri = null
+            mp3File.absolutePath
+        }
+        val writingToMediaStore = targetPfd != null
+        Log.d("AudioCaptureService", "MP3 output: $outputPath (mediaStore=$writingToMediaStore)")
+
+        fun closeTarget() {
+            runCatching { targetPfd?.close() }
+            targetPfd = null
+        }
+
+        fun commitTarget() {
+            val uri = targetUri ?: return
+            closeTarget()
+            finalizeMediaStoreEntry(uri)
+        }
+
+        fun discardTarget() {
+            val uri = targetUri ?: return
+            closeTarget()
+            runCatching { contentResolver.delete(uri, null, null) }
+            targetUri = null
+        }
         /**
          * Turns the finished stream into a saved recording. This never blocks
          * the stop path: while ffmpeg is still flushing, its own completion
@@ -675,10 +711,14 @@ class AudioCaptureService : Service() {
         fun finalizeStream(streamOk: Boolean) {
             if (!finalized.compareAndSet(false, true)) return
             try {
+                val encodeUsable = streamOk && !state.stalled.get()
+                val fileHasData = writingToMediaStore || mp3File.length() > 0L
+
                 if (totalBytesCaptured == 0L) {
-                    // Only silence padding landed on disk, so there is nothing
-                    // worth keeping. Say so instead of saving an empty file.
+                    // Nothing real was captured, so there is nothing worth
+                    // keeping. Say so instead of saving an empty file.
                     Log.e("AudioCaptureService", "Streaming session never received real audio")
+                    discardTarget()
                     pcmFile.delete()
                     mp3File.delete()
                     withMainThread { overlayManager.hideEncoding() }
@@ -687,23 +727,29 @@ class AudioCaptureService : Service() {
                         getString(R.string.capture_failed_title),
                         getString(R.string.capture_failed_text)
                     )
-                } else if (streamOk && !state.stalled.get() && mp3File.length() > 0L) {
-                    copyFileToMediaStore(mp3File, "recording_$timestamp.mp3", "audio/mpeg")
-                    Log.d("AudioCaptureService", "Streaming MP3 saved (${mp3File.length()} bytes)")
+                } else if (encodeUsable && fileHasData) {
+                    if (writingToMediaStore) {
+                        commitTarget()
+                    } else {
+                        copyFileToMediaStore(mp3File, "recording_$timestamp.mp3", "audio/mpeg")
+                        mp3File.delete()
+                    }
+                    Log.d("AudioCaptureService", "Streaming MP3 saved (mediaStore=$writingToMediaStore)")
                     withMainThread { overlayManager.hideEncoding() }
                     restoreIdleNotification()
                     pcmFile.delete()
-                    mp3File.delete()
                 } else if (pcmFile.length() > 0L) {
                     Log.w(
                         "AudioCaptureService",
                         "Streaming path unusable (ok=$streamOk, stalled=${state.stalled.get()}), " +
                             "encoding ${pcmFile.length()} bytes of PCM backup"
                     )
+                    discardTarget()
                     withMainThread { overlayManager.showEncoding() }
                     encodeMp3Async(pcmFile, timestamp, bitrate, "${timestamp}_fb")
                 } else {
                     Log.e("AudioCaptureService", "Streaming MP3 produced no usable output")
+                    discardTarget()
                     pcmFile.delete()
                     mp3File.delete()
                     withMainThread { overlayManager.hideEncoding() }
@@ -715,6 +761,7 @@ class AudioCaptureService : Service() {
                 }
             } catch (t: Throwable) {
                 Log.e("AudioCaptureService", "Error finalising streaming MP3", t)
+                runCatching { discardTarget() }
                 withMainThread { overlayManager.hideEncoding() }
                 restoreIdleNotification()
                 reportCaptureFailure(
@@ -730,7 +777,7 @@ class AudioCaptureService : Service() {
             withMainThread { overlayManager.updateState(true) }
 
             val command = "-y -f s16le -ar $SAMPLE_RATE -ac $CHANNEL_COUNT " +
-                "-i ${fifoFile.absolutePath} -codec:a libmp3lame -b:a ${bitrate.bitsPerSecond} ${mp3File.absolutePath}"
+                "-i ${fifoFile.absolutePath} -codec:a libmp3lame -b:a ${bitrate.bitsPerSecond} $outputPath"
 
             val streamSession = FFmpegKit.executeAsync(
                 command,
@@ -1141,6 +1188,20 @@ class AudioCaptureService : Service() {
         channel.write(ByteBuffer.wrap(header))
     }
 
+    /** Creates a pending MP3 entry the encoder can write into directly. */
+    private fun createMp3Entry(timestamp: String): Uri? {
+        val values = ContentValues().apply {
+            put(MediaStore.Audio.Media.DISPLAY_NAME, "recording_$timestamp.mp3")
+            put(MediaStore.Audio.Media.MIME_TYPE, "audio/mpeg")
+            put(MediaStore.Audio.Media.RELATIVE_PATH, "Music/RekamAudio")
+            put(MediaStore.Audio.Media.IS_PENDING, 1)
+        }
+        val collection = MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        return runCatching { contentResolver.insert(collection, values) }
+            .onFailure { Log.e("AudioCaptureService", "Failed to create MP3 entry", it) }
+            .getOrNull()
+    }
+
     private fun createMediaStoreEntry(isWav: Boolean): Uri? {
         val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
         val fileName = if (isWav) "recording_$timestamp.wav" else "recording_$timestamp.m4a"
@@ -1242,9 +1303,7 @@ class AudioCaptureService : Service() {
             consecutiveReadErrors = 0
             totalBytesCaptured += result
             updatePeakAmplitude(buffer, copied)
-            val now = SystemClock.elapsedRealtime()
-            lastCaptureProgressAt = now
-            lastTimelineFillAt = now
+            lastCaptureProgressAt = SystemClock.elapsedRealtime()
             if (stallWarningActive && sessionPeakAmplitude >= AUDIBLE_PEAK_THRESHOLD) {
                 clearStallWarning()
             }
@@ -1257,27 +1316,11 @@ class AudioCaptureService : Service() {
         }
 
         // Nothing delivered right now. In non-blocking mode this happens all the
-        // time between real frames, so only a genuinely long gap is padded —
-        // padding every momentary empty read is what chopped recordings into
-        // audible fragments.
-        val now = SystemClock.elapsedRealtime()
-        val gapMs = now - lastTimelineFillAt
-        if (gapMs < SILENCE_PAD_THRESHOLD_MS) {
-            Thread.sleep(EMPTY_READ_SLEEP_MS)
-            return 0
-        }
-
-        val padMs = gapMs.coerceAtMost(MAX_SILENCE_GAP_MS)
-        var silenceBytes = ((padMs * SAMPLE_RATE / 1000) * BYTES_PER_PCM_FRAME).toInt()
-        silenceBytes = (silenceBytes / BYTES_PER_PCM_FRAME) * BYTES_PER_PCM_FRAME
-        if (silenceBytes <= 0) {
-            Thread.sleep(EMPTY_READ_SLEEP_MS)
-            return 0
-        }
-        val toFill = minOf(silenceBytes, size)
-        java.util.Arrays.fill(buffer, 0, toFill, 0.toByte())
-        lastTimelineFillAt = now
-        return toFill
+        // time between real frames, so just wait briefly and try again. Nothing
+        // is written: the file only ever contains real audio, which keeps the
+        // timeline honest and cannot introduce gaps between frames.
+        Thread.sleep(EMPTY_READ_SLEEP_MS)
+        return 0
     }
 
     /**
@@ -1534,18 +1577,6 @@ class AudioCaptureService : Service() {
 
         /** Shorter pause while simply waiting for the next frame to arrive. */
         private const val EMPTY_READ_SLEEP_MS = 20L
-
-        /** 16-bit stereo: one frame is 2 channels x 2 bytes. */
-        private const val BYTES_PER_PCM_FRAME = 4
-
-        /**
-         * Gaps shorter than this are just normal frame timing. Padding them
-         * would insert silence between real chunks and chop the audio up.
-         */
-        private const val SILENCE_PAD_THRESHOLD_MS = 500L
-
-        /** Cap on a single silence padding burst so a stall cannot inflate a file. */
-        private const val MAX_SILENCE_GAP_MS = 2_000L
 
         /** Peak amplitude above this counts as real audio (16-bit full scale). */
         private const val AUDIBLE_PEAK_THRESHOLD = 32
