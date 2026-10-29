@@ -61,10 +61,10 @@
     <string name="streaming_encoding_on">開啟 – 邊錄邊編碼，僅支援 128/192 kbps</string>
     <string name="streaming_encoding_off">關閉 – 停止後統一編碼</string>
     <string name="capture_failed_title">這次沒有錄到聲音</string>
-    <string name="capture_failed_text">系統本次沒有提供內部音訊，檔案未儲存。請重新授權螢幕錄製權限後再試一次。</string>
+    <string name="capture_failed_text">未錄到聲音，請重新授權後重試。</string>
     <string name="capture_silent_title">暫時沒有擷取到聲音</string>
-    <string name="capture_silent_text">錄音仍在繼續，但系統目前沒有輸出內部音訊，這段時間不會被記錄。請確認有聲音在播放，開始播放後會自動繼續錄入。</string>
-    <string name="capture_partial_text">已錄到的部分會正常儲存，但之後可能不再錄音。請停止後重新開始錄音。</string>
+    <string name="capture_silent_text">暫無聲音，仍在錄，請確認有聲音在播放。</string>
+    <string name="capture_partial_text">錄音中斷，已儲存到中斷前，請重新開始。</string>
     <string name="capture_partial_short">錄音中斷，已錄部分已儲存</string>
     <string name="about_category">關於</string>
     <string name="app_version">應用程式版本</string>
